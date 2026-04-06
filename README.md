@@ -25,9 +25,30 @@ This ensures Anthropic sees a "Claude Code" request while OpenClaw sees its orig
 ## Requirements
 
 - **Node.js** 18+
-- **Claude Code CLI** authenticated (`claude auth login`)
 - **Claude Max or Pro subscription**
+- **Claude Code CLI** installed and authenticated
 - **OpenClaw** installed and running
+
+### Installing Claude Code CLI (if not already installed)
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+Then authenticate with your Claude account:
+
+```bash
+claude auth login
+```
+
+This opens a browser window to sign in with your Claude Max/Pro account. Once authenticated, credentials are stored at `~/.claude/.credentials.json`. The proxy reads from this file.
+
+Verify it worked:
+
+```bash
+claude auth status
+# Should show: loggedIn: true, subscriptionType: max (or pro)
+```
 
 ## Quick Start
 
