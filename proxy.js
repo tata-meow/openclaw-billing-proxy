@@ -218,6 +218,41 @@ function reverseMap(text, config) {
   return result;
 }
 
+// Maximum keyword length across all reverse-map patterns.
+// Used to determine how much tail data to hold back between SSE chunks,
+// so that a keyword split across two chunks is still caught.
+function maxPatternLen(config) {
+  let max = 0;
+  for (const [sanitized] of config.reverseMap) {
+    if (sanitized.length > max) max = sanitized.length;
+  }
+  return max;
+}
+
+// Creates a stateful streaming reverse-mapper that buffers potential
+// partial matches at chunk boundaries.
+function createStreamReverser(config) {
+  const holdBack = maxPatternLen(config) - 1; // chars to retain between chunks
+  let pending = '';
+
+  return {
+    // Process an incoming chunk; returns the safe-to-flush portion.
+    write(chunk) {
+      pending += chunk;
+      if (pending.length <= holdBack) return '';  // not enough data yet
+      const safe = pending.slice(0, pending.length - holdBack);
+      pending = pending.slice(pending.length - holdBack);
+      return reverseMap(safe, config);
+    },
+    // Flush remaining buffer (call on stream end).
+    flush() {
+      const rest = pending;
+      pending = '';
+      return reverseMap(rest, config);
+    }
+  };
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -302,10 +337,16 @@ function startServer(config) {
         // For SSE streaming responses, reverse-map each chunk
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(upRes.statusCode, upRes.headers);
+          const reverser = createStreamReverser(config);
           upRes.on('data', (chunk) => {
-            res.write(reverseMap(chunk.toString(), config));
+            const out = reverser.write(chunk.toString());
+            if (out) res.write(out);
           });
-          upRes.on('end', () => res.end());
+          upRes.on('end', () => {
+            const tail = reverser.flush();
+            if (tail) res.write(tail);
+            res.end();
+          });
         }
         // For JSON responses (errors, non-streaming), buffer and reverse-map
         else {
