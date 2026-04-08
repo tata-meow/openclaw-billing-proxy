@@ -241,8 +241,15 @@ function createStreamReverser(config) {
     write(chunk) {
       pending += chunk;
       if (pending.length <= holdBack) return '';  // not enough data yet
-      const safe = pending.slice(0, pending.length - holdBack);
-      pending = pending.slice(pending.length - holdBack);
+      let cut = pending.length - holdBack;
+      // Don't slice between surrogate pairs (emoji etc.)
+      if (cut > 0 && cut < pending.length) {
+        const code = pending.charCodeAt(cut - 1);
+        if (code >= 0xD800 && code <= 0xDBFF) cut--;  // high surrogate — back up one
+      }
+      if (cut <= 0) return '';
+      const safe = pending.slice(0, cut);
+      pending = pending.slice(cut);
       return reverseMap(safe, config);
     },
     // Flush remaining buffer (call on stream end).
