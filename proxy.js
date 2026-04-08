@@ -28,6 +28,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
@@ -337,12 +338,18 @@ function startServer(config) {
         // For SSE streaming responses, reverse-map each chunk
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(upRes.statusCode, upRes.headers);
+          const decoder = new StringDecoder('utf8');
           const reverser = createStreamReverser(config);
           upRes.on('data', (chunk) => {
-            const out = reverser.write(chunk.toString());
+            const out = reverser.write(decoder.write(chunk));
             if (out) res.write(out);
           });
           upRes.on('end', () => {
+            const trailing = decoder.end();
+            if (trailing) {
+              const out = reverser.write(trailing);
+              if (out) res.write(out);
+            }
             const tail = reverser.flush();
             if (tail) res.write(tail);
             res.end();
