@@ -5,7 +5,11 @@
  * Auto-detects OpenClaw configuration, scans for sessions_* tools,
  * and generates sanitization + reverse mapping rules.
  *
- * Usage: node setup.js
+ * Usage: node setup.js [--passthrough]
+ *
+ * Options:
+ *   --passthrough  Generate config for passthrough mode (replacement only,
+ *                  no credential handling or billing injection)
  */
 
 const fs = require('fs');
@@ -13,143 +17,154 @@ const path = require('path');
 const os = require('os');
 
 const homeDir = os.homedir();
+const passthrough = process.argv.includes('--passthrough');
 
-console.log('\n  OpenClaw Billing Proxy Setup');
-console.log('  ---------------------------\n');
+if (passthrough) {
+  console.log('\n  OpenClaw Replacement Proxy Setup (passthrough mode)');
+  console.log('  ---------------------------------------------------\n');
+} else {
+  console.log('\n  OpenClaw Billing Proxy Setup');
+  console.log('  ---------------------------\n');
+}
 
-// Step 1: Check Claude Code auth
-console.log('1. Checking Claude Code authentication...');
-const credsPaths = [
-  path.join(homeDir, '.claude', '.credentials.json'),
-  path.join(homeDir, '.claude', 'credentials.json')
-];
-
+// Step 1: Check Claude Code auth (skip in passthrough mode)
 let credsPath = null;
 let creds = null;
 
-// Check file-based credentials
-for (const p of credsPaths) {
-  if (fs.existsSync(p)) {
-    const stat = fs.statSync(p);
-    if (stat.size > 0) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
-        if (parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken) {
-          credsPath = p;
-          creds = parsed;
-          break;
-        }
-      } catch (e) { /* invalid JSON, skip */ }
-    }
-  }
-}
+if (passthrough) {
+  console.log('1. Skipping credential check (passthrough mode)');
+  console.log('   Headers will be forwarded as-is from OpenClaw');
+} else {
+  console.log('1. Checking Claude Code authentication...');
+  const credsPaths = [
+    path.join(homeDir, '.claude', '.credentials.json'),
+    path.join(homeDir, '.claude', 'credentials.json')
+  ];
 
-// If no file-based credentials, try macOS Keychain
-if (!creds && process.platform === 'darwin') {
-  console.log('   File credentials not found, checking macOS Keychain...');
-  const { execSync } = require('child_process');
-
-  // Try common Keychain service names
-  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
-  let keychainToken = null;
-
-  for (const svc of keychainNames) {
-    try {
-      keychainToken = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
-      if (keychainToken) {
-        console.log('   Found token in macOS Keychain (service: ' + svc + ')');
-        break;
-      }
-    } catch (e) { /* not found, try next */ }
-  }
-
-  if (keychainToken) {
-    // The Keychain might store the full JSON or just the token
-    try {
-      const parsed = JSON.parse(keychainToken);
-      if (parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken) {
-        creds = parsed;
-      }
-    } catch (e) {
-      // Raw token string -- wrap in expected structure
-      if (keychainToken.startsWith('sk-ant-')) {
-        creds = {
-          claudeAiOauth: {
-            accessToken: keychainToken,
-            expiresAt: Date.now() + 86400000, // assume 24h -- will be refreshed
-            subscriptionType: 'unknown'
-          }
-        };
-        console.log('   Extracted raw token from Keychain');
-      }
-    }
-
-    if (creds) {
-      // Write credentials to file so the proxy can read them
-      credsPath = path.join(homeDir, '.claude', '.credentials.json');
-      const claudeDir = path.join(homeDir, '.claude');
-      if (!fs.existsSync(claudeDir)) { fs.mkdirSync(claudeDir, { recursive: true }); }
-      fs.writeFileSync(credsPath, JSON.stringify(creds));
-      console.log('   Written Keychain credentials to: ' + credsPath);
-      console.log('   NOTE: You may need to re-run this after token refresh (every ~24h)');
-    }
-  }
-}
-
-// If still no credentials, try forcing a credential write via claude CLI
-if (!creds) {
-  console.log('   No credentials found. Attempting to trigger credential write...');
-  const { execSync } = require('child_process');
-  try {
-    execSync('claude -p "ping" --max-turns 1 --no-session-persistence --output-format json 2>/dev/null', {
-      timeout: 30000,
-      stdio: 'pipe'
-    });
-    // Re-check files after the CLI call
-    for (const p of credsPaths) {
-      if (fs.existsSync(p) && fs.statSync(p).size > 0) {
+  // Check file-based credentials
+  for (const p of credsPaths) {
+    if (fs.existsSync(p)) {
+      const stat = fs.statSync(p);
+      if (stat.size > 0) {
         try {
           const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
           if (parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken) {
             credsPath = p;
             creds = parsed;
-            console.log('   Credential write triggered successfully: ' + p);
             break;
           }
-        } catch (e) { /* skip */ }
+        } catch (e) { /* invalid JSON, skip */ }
       }
     }
-  } catch (e) {
-    // CLI not available or failed
   }
-}
 
-if (!creds) {
-  console.error('   CREDENTIALS NOT FOUND.');
-  console.error('');
-  console.error('   Claude Code CLI must be installed and authenticated:');
-  console.error('');
-  console.error('     npm install -g @anthropic-ai/claude-code');
-  console.error('     claude auth login');
-  console.error('');
-  console.error('   This opens a browser to sign in with your Claude Max/Pro account.');
-  console.error('   After authenticating, run this setup script again.');
-  console.error('');
-  console.error('   Searched for credentials at:');
-  for (const p of credsPaths) { console.error('     ' + p); }
-  if (process.platform === 'darwin') {
-    console.error('     macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+  // If no file-based credentials, try macOS Keychain
+  if (!creds && process.platform === 'darwin') {
+    console.log('   File credentials not found, checking macOS Keychain...');
+    const { execSync } = require('child_process');
+
+    // Try common Keychain service names
+    const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+    let keychainToken = null;
+
+    for (const svc of keychainNames) {
+      try {
+        keychainToken = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (keychainToken) {
+          console.log('   Found token in macOS Keychain (service: ' + svc + ')');
+          break;
+        }
+      } catch (e) { /* not found, try next */ }
+    }
+
+    if (keychainToken) {
+      // The Keychain might store the full JSON or just the token
+      try {
+        const parsed = JSON.parse(keychainToken);
+        if (parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken) {
+          creds = parsed;
+        }
+      } catch (e) {
+        // Raw token string -- wrap in expected structure
+        if (keychainToken.startsWith('sk-ant-')) {
+          creds = {
+            claudeAiOauth: {
+              accessToken: keychainToken,
+              expiresAt: Date.now() + 86400000, // assume 24h -- will be refreshed
+              subscriptionType: 'unknown'
+            }
+          };
+          console.log('   Extracted raw token from Keychain');
+        }
+      }
+
+      if (creds) {
+        // Write credentials to file so the proxy can read them
+        credsPath = path.join(homeDir, '.claude', '.credentials.json');
+        const claudeDir = path.join(homeDir, '.claude');
+        if (!fs.existsSync(claudeDir)) { fs.mkdirSync(claudeDir, { recursive: true }); }
+        fs.writeFileSync(credsPath, JSON.stringify(creds));
+        console.log('   Written Keychain credentials to: ' + credsPath);
+        console.log('   NOTE: You may need to re-run this after token refresh (every ~24h)');
+      }
+    }
   }
-  console.error('');
-  console.error('   If claude auth status shows you are logged in but no file exists,');
-  console.error('   your Claude Code version stores tokens in the macOS Keychain.');
-  console.error('   Run: claude -p "test" --max-turns 1 --no-session-persistence');
-  console.error('   Then try this setup again.');
-  process.exit(1);
-}
 
-const expiresIn = ((creds.claudeAiOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
-console.log('   OK: ' + (creds.claudeAiOauth.subscriptionType || 'unknown') + ' subscription, token expires in ' + expiresIn + 'h');
+  // If still no credentials, try forcing a credential write via claude CLI
+  if (!creds) {
+    console.log('   No credentials found. Attempting to trigger credential write...');
+    const { execSync } = require('child_process');
+    try {
+      execSync('claude -p "ping" --max-turns 1 --no-session-persistence --output-format json 2>/dev/null', {
+        timeout: 30000,
+        stdio: 'pipe'
+      });
+      // Re-check files after the CLI call
+      for (const p of credsPaths) {
+        if (fs.existsSync(p) && fs.statSync(p).size > 0) {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+            if (parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken) {
+              credsPath = p;
+              creds = parsed;
+              console.log('   Credential write triggered successfully: ' + p);
+              break;
+            }
+          } catch (e) { /* skip */ }
+        }
+      }
+    } catch (e) {
+      // CLI not available or failed
+    }
+  }
+
+  if (!creds) {
+    console.error('   CREDENTIALS NOT FOUND.');
+    console.error('');
+    console.error('   Claude Code CLI must be installed and authenticated:');
+    console.error('');
+    console.error('     npm install -g @anthropic-ai/claude-code');
+    console.error('     claude auth login');
+    console.error('');
+    console.error('   This opens a browser to sign in with your Claude Max/Pro account.');
+    console.error('   After authenticating, run this setup script again.');
+    console.error('');
+    console.error('   Searched for credentials at:');
+    for (const p of credsPaths) { console.error('     ' + p); }
+    if (process.platform === 'darwin') {
+      console.error('     macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    }
+    console.error('');
+    console.error('   If claude auth status shows you are logged in but no file exists,');
+    console.error('   your Claude Code version stores tokens in the macOS Keychain.');
+    console.error('   Run: claude -p "test" --max-turns 1 --no-session-persistence');
+    console.error('   Then try this setup again.');
+    process.exit(1);
+  }
+
+  const expiresIn = ((creds.claudeAiOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+  console.log('   OK: ' + (creds.claudeAiOauth.subscriptionType || 'unknown') + ' subscription, token expires in ' + expiresIn + 'h');
+}
 
 // Step 2: Find OpenClaw config
 console.log('\n2. Finding OpenClaw configuration...');
@@ -319,12 +334,14 @@ if (oclawPath) {
 // Step 4: Generate config
 console.log('\n4. Generating configuration...');
 
-const config = {
-  port: 18801,
-  credentialsPath: credsPath,
-  replacements: replacements,
-  reverseMap: reverseMap
-};
+const config = { port: 18801 };
+if (passthrough) {
+  config.passthrough = true;
+} else {
+  config.credentialsPath = credsPath;
+}
+config.replacements = replacements;
+config.reverseMap = reverseMap;
 
 const configPath = path.join(process.cwd(), 'config.json');
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
@@ -351,7 +368,12 @@ if (oclawPath) {
 }
 
 console.log('\n   Troubleshooting:');
-console.log('   - If requests fail with "extra usage" errors, check proxy console for 400 status codes');
+console.log('   - If requests fail, check proxy console for status codes');
 console.log('   - Add any new sessions_* tools to both replacements and reverseMap in config.json');
 console.log('   - If your assistant name is blocked (rare), add it to replacements and reverseMap');
-console.log('   - Token refreshes when you open Claude Code CLI -- do this every 24h\n');
+if (passthrough) {
+  console.log('   - Passthrough mode forwards auth headers as-is -- ensure OpenClaw has valid credentials');
+} else {
+  console.log('   - Token refreshes when you open Claude Code CLI -- do this every 24h');
+}
+console.log('');
