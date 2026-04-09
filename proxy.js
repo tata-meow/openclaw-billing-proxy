@@ -694,10 +694,27 @@ function startServer(config) {
           });
           return;
         }
+        // SSE streaming — tail-buffer reverseMap to handle patterns split across
+        // TCP chunk boundaries. Without this, "ocplatform" can split as "ocp"+"latform"
+        // and leak through. TAIL_SIZE >= longest reverseMap pattern. (issue #11)
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(status, upRes.headers);
-          upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-          upRes.on('end', () => res.end());
+          const TAIL_SIZE = 64;
+          let pending = '';
+          upRes.on('data', (chunk) => {
+            pending += chunk.toString();
+            if (pending.length > TAIL_SIZE) {
+              const flushable = pending.slice(0, pending.length - TAIL_SIZE);
+              pending = pending.slice(pending.length - TAIL_SIZE);
+              res.write(reverseMap(flushable, config));
+            }
+          });
+          upRes.on('end', () => {
+            if (pending.length > 0) {
+              res.write(reverseMap(pending, config));
+            }
+            res.end();
+          });
         } else {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));

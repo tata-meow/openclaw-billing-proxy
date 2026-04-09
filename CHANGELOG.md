@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.1.3 -- 2026-04-09
+
+### Tail-buffer SSE reverse mapping for chunk boundary splits
+
+**Changes:**
+- SSE streaming handler now keeps a 64-byte tail buffer between TCP chunks before
+  applying `reverseMap()`. Prevents sanitized patterns (e.g. `ocplatform`) from being
+  split across chunk boundaries (`ocp` + `latform`) and leaking through un-reversed.
+- On `end`, remaining tail is flushed through `reverseMap()`.
+- `TAIL_SIZE=64` is >= longest current pattern (24 chars) with 2.5x headroom.
+
+**Why:**
+TCP chunks are arbitrary. A reverse mapping pattern can be split across two `data`
+events. The previous code called `reverseMap()` on each chunk individually, so
+neither half matched the full pattern. In OpenClaw this manifested as workspace
+paths like `.ocplatform/` leaking through instead of `.openclaw/`, causing `ENOENT`
+on tool calls.
+
+**Inspired by:** PR #15 (kokoima) which identified the bug and provided the
+tail-buffer approach.
+
+---
+
 ## v2.1.2 -- 2026-04-09
 
 ### Fix escaped JSON reverse mapping in SSE tool_use args (closes #11)
