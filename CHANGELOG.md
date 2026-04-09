@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.1.1 -- 2026-04-09
+
+### Strip trailing assistant prefill (Opus 4.6 compatibility)
+
+**Changes:**
+- Added Layer 8: raw-string trailing assistant message stripping. Opus 4.6 disabled
+  assistant message prefill — OpenClaw sometimes pre-fills the next assistant turn
+  to resume interrupted responses, causing permanent 400 errors for the session.
+- Uses string-aware forward scanning with bracket depth tracking (handles braces
+  and quotes inside text content). Zero JSON.parse/stringify — body bytes preserved.
+- Enabled by default. Opt-out: `"stripTrailingAssistantPrefill": false` in config.json.
+
+**Why:**
+When OpenClaw pre-fills a trailing assistant message, Anthropic returns:
+`"This model does not support assistant message prefill. The conversation must end
+with a user message."` The prefill stays in conversation history, so every retry
+fails the same way and the channel becomes permanently stuck.
+
+**Inspired by:** PR #17 (kokoima) which identified the bug. Our implementation uses
+raw string manipulation instead of JSON.parse to avoid re-serialization risks on
+large bodies.
+
+---
+
+## v2.1.0 -- 2026-04-09
+
+### Cherry-pick CC signature emulation + remove image rename collision
+
+**Changes:**
+- Dynamic billing fingerprint: SHA256-based 3-char hash matching real CC's
+  `utils/fingerprint.ts`, computed per-request from first user message
+- Updated CC version to 2.1.97, entrypoint changed from `sdk-cli` to `cli`
+- Stainless SDK headers: `x-stainless-arch/lang/os/package-version/runtime` etc.
+- CC identity headers: `user-agent`, `x-app`, `x-claude-code-session-id`
+- Request metadata injection: `device_id` + `session_id` in CC format
+- Updated beta flags: added `advanced-tool-use-2025-11-20`, `fast-mode-2026-02-01`
+- Strips `x-session-affinity` header (non-CC leak)
+- **Removed `image` → `ImageGen` tool rename** (PR #19, kokoima): collided with
+  Anthropic's `"type":"image"` content block tag, causing permanent session failures
+  when conversation history contained images
+
+**Inspired by:** PR #12 (marco-jardim) for fingerprint hash, Stainless headers,
+updated CC version. PR #19 (kokoima) for the image rename collision fix.
+
+---
+
 ## v2.0.0 -- 2026-04-08
 
 ### Defeat Anthropic's upgraded detection (tool-name fingerprinting + template matching)

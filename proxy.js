@@ -353,7 +353,8 @@ function loadConfig() {
     propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false
+    injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
 
@@ -515,6 +516,51 @@ function processBody(bodyStr, config) {
   } else {
     // Insert after opening brace
     m = '{' + metaJson + ',' + m.slice(1);
+  }
+
+  // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
+  // Opus 4.6 disabled assistant message prefill. OpenClaw sometimes pre-fills the
+  // next assistant turn to resume interrupted responses, causing permanent 400
+  // errors ("This model does not support assistant message prefill"). The error is
+  // permanent for the affected session — every retry includes the same prefill.
+  // Fix: forward-scan the messages array with string-aware bracket matching,
+  // then pop trailing assistant messages until the array ends with a user message.
+  if (config.stripTrailingAssistantPrefill !== false) {
+    const msgsIdx = m.indexOf('"messages":[');
+    if (msgsIdx !== -1) {
+      const arrayStart = msgsIdx + '"messages":['.length;
+      const positions = [];
+      let depth = 0, inString = false, objStart = -1;
+      for (let i = arrayStart; i < m.length; i++) {
+        const c = m[i];
+        if (inString) {
+          if (c === '\\') { i++; continue; }
+          if (c === '"') inString = false;
+          continue;
+        }
+        if (c === '"') { inString = true; continue; }
+        if (c === '{') { if (depth === 0) objStart = i; depth++; }
+        else if (c === '}') { depth--; if (depth === 0 && objStart !== -1) { positions.push({ start: objStart, end: i }); objStart = -1; } }
+        else if (c === ']' && depth === 0) break;
+      }
+      let popped = 0;
+      while (positions.length > 0) {
+        const last = positions[positions.length - 1];
+        const obj = m.slice(last.start, last.end + 1);
+        if (!obj.includes('"role":"assistant"')) break;
+        let stripFrom = last.start;
+        for (let i = last.start - 1; i >= arrayStart; i--) {
+          if (m[i] === ',') { stripFrom = i; break; }
+          if (m[i] !== ' ' && m[i] !== '\n' && m[i] !== '\r' && m[i] !== '\t') break;
+        }
+        m = m.slice(0, stripFrom) + m.slice(last.end + 1);
+        positions.pop();
+        popped++;
+      }
+      if (popped > 0) {
+        console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
+      }
+    }
   }
 
   return m;
