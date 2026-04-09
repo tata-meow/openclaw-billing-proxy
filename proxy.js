@@ -217,7 +217,13 @@ const DEFAULT_TOOL_RENAMES = [
   ['session_status', 'StatusCheck'],
   ['web_search', 'WebSearch'],
   ['web_fetch', 'WebFetch'],
-  ['image', 'ImageGen'],
+  // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
+  // type "image". OpenClaw tool_results carrying image content blocks would have
+  // their `"type": "image"` field renamed and Anthropic rejects with:
+  //   messages.N.content.M.tool_result.content.K: Input tag 'ImageGen' found
+  //   using 'type' does not match any of the expected tags
+  // The fingerprint signal lost from one tool name is much smaller than the
+  // certainty of breaking every conversation that ever touched an image. (issue #14)
   ['pdf', 'PdfParse'],
   ['memory_search', 'KnowledgeSearch'],
   ['memory_get', 'KnowledgeGet'],
