@@ -100,63 +100,68 @@ function loadConfig() {
     config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
   }
 
-  // Find Claude Code credentials
-  const homeDir = os.homedir();
-  const credsPaths = [
-    config.credentialsPath,
-    path.join(homeDir, '.claude', '.credentials.json'),
-    path.join(homeDir, '.claude', 'credentials.json')
-  ].filter(Boolean);
+  const passthrough = config.passthrough === true;
 
   let credsPath = null;
-  for (const p of credsPaths) {
-    const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
-      credsPath = resolved;
-      break;
-    }
-  }
+  if (!passthrough) {
+    // Find Claude Code credentials
+    const homeDir = os.homedir();
+    const credsPaths = [
+      config.credentialsPath,
+      path.join(homeDir, '.claude', '.credentials.json'),
+      path.join(homeDir, '.claude', 'credentials.json')
+    ].filter(Boolean);
 
-  // macOS Keychain fallback: extract token and write to file
-  if (!credsPath && process.platform === 'darwin') {
-    const { execSync } = require('child_process');
-    const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
-    for (const svc of keychainNames) {
-      try {
-        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (token) {
-          let creds;
-          try { creds = JSON.parse(token); } catch(e) {
-            if (token.startsWith('sk-ant-')) {
-              creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+    for (const p of credsPaths) {
+      const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
+      if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
+        credsPath = resolved;
+        break;
+      }
+    }
+
+    // macOS Keychain fallback: extract token and write to file
+    if (!credsPath && process.platform === 'darwin') {
+      const { execSync } = require('child_process');
+      const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+      for (const svc of keychainNames) {
+        try {
+          const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+          if (token) {
+            let creds;
+            try { creds = JSON.parse(token); } catch(e) {
+              if (token.startsWith('sk-ant-')) {
+                creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+              }
+            }
+            if (creds && creds.claudeAiOauth) {
+              credsPath = path.join(homeDir, '.claude', '.credentials.json');
+              fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+              fs.writeFileSync(credsPath, JSON.stringify(creds));
+              console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
+              break;
             }
           }
-          if (creds && creds.claudeAiOauth) {
-            credsPath = path.join(homeDir, '.claude', '.credentials.json');
-            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
-            fs.writeFileSync(credsPath, JSON.stringify(creds));
-            console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
-            break;
-          }
-        }
-      } catch(e) { /* not found */ }
+        } catch(e) { /* not found */ }
+      }
     }
-  }
 
-  if (!credsPath) {
-    console.error('[ERROR] Claude Code credentials not found.');
-    console.error('Run "claude auth login" first to authenticate.');
-    console.error('On macOS, try: claude -p "test" --max-turns 1 --no-session-persistence');
-    console.error('Then run this proxy again.');
-    console.error('Searched:', credsPaths.join(', '));
-    if (process.platform === 'darwin') {
-      console.error('Also checked macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    if (!credsPath) {
+      console.error('[ERROR] Claude Code credentials not found.');
+      console.error('Run "claude auth login" first to authenticate.');
+      console.error('On macOS, try: claude -p "test" --max-turns 1 --no-session-persistence');
+      console.error('Then run this proxy again.');
+      console.error('Searched:', credsPaths.join(', '));
+      if (process.platform === 'darwin') {
+        console.error('Also checked macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+      }
+      process.exit(1);
     }
-    process.exit(1);
   }
 
   return {
     port: config.port || port,
+    passthrough,
     credsPath,
     replacements: config.replacements || DEFAULT_REPLACEMENTS,
     reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP
@@ -185,26 +190,28 @@ function processBody(bodyStr, config) {
     modified = modified.split(find).join(replace);
   }
 
-  // 2. Inject billing block into system prompt
-  const sysArrayIdx = modified.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
-  } else if (modified.includes('"system":"')) {
-    const sysStart = modified.indexOf('"system":"');
-    let i = sysStart + '"system":"'.length;
-    while (i < modified.length) {
-      if (modified[i] === '\\') { i += 2; continue; }
-      if (modified[i] === '"') break;
-      i++;
+  // 2. Inject billing block into system prompt (skip in passthrough mode)
+  if (!config.passthrough) {
+    const sysArrayIdx = modified.indexOf('"system":[');
+    if (sysArrayIdx !== -1) {
+      const insertAt = sysArrayIdx + '"system":['.length;
+      modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
+    } else if (modified.includes('"system":"')) {
+      const sysStart = modified.indexOf('"system":"');
+      let i = sysStart + '"system":"'.length;
+      while (i < modified.length) {
+        if (modified[i] === '\\') { i += 2; continue; }
+        if (modified[i] === '"') break;
+        i++;
+      }
+      const sysEnd = i + 1;
+      const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
+      modified = modified.slice(0, sysStart)
+        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + modified.slice(sysEnd);
+    } else {
+      modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
     }
-    const sysEnd = i + 1;
-    const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
-    modified = modified.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
-      + modified.slice(sysEnd);
-  } else {
-    modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
   }
 
   return modified;
@@ -268,23 +275,37 @@ function startServer(config) {
 
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
-      try {
-        const oauth = getToken(config.credsPath);
-        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+      if (config.passthrough) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          status: expiresIn > 0 ? 'ok' : 'token_expired',
+          status: 'ok',
           proxy: 'openclaw-billing-proxy',
+          mode: 'passthrough',
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
-          tokenExpiresInHours: expiresIn.toFixed(1),
-          subscriptionType: oauth.subscriptionType,
           replacementPatterns: config.replacements.length,
           reverseMapPatterns: config.reverseMap.length
         }));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', message: e.message }));
+      } else {
+        try {
+          const oauth = getToken(config.credsPath);
+          const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            status: expiresIn > 0 ? 'ok' : 'token_expired',
+            proxy: 'openclaw-billing-proxy',
+            mode: 'billing',
+            requestsServed: requestCount,
+            uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
+            tokenExpiresInHours: expiresIn.toFixed(1),
+            subscriptionType: oauth.subscriptionType,
+            replacementPatterns: config.replacements.length,
+            reverseMapPatterns: config.reverseMap.length
+          }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'error', message: e.message }));
+        }
       }
       return;
     }
@@ -297,41 +318,53 @@ function startServer(config) {
     req.on('end', () => {
       let body = Buffer.concat(chunks);
 
-      let oauth;
-      try {
-        oauth = getToken(config.credsPath);
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
-        return;
-      }
-
-      // Process body: sanitize triggers + inject billing header
+      // Process body: sanitize triggers (+ inject billing header unless passthrough)
       let bodyStr = body.toString('utf8');
       bodyStr = processBody(bodyStr, config);
       body = Buffer.from(bodyStr, 'utf8');
 
       // Build upstream headers
       const headers = {};
-      for (const [key, value] of Object.entries(req.headers)) {
-        const lk = key.toLowerCase();
-        if (lk === 'host' || lk === 'connection') continue;
-        if (lk === 'authorization' || lk === 'x-api-key') continue;
-        if (lk === 'content-length') continue;
-        headers[key] = value;
-      }
+      if (config.passthrough) {
+        // Pass through all headers except hop-by-hop; recalculate content-length
+        for (const [key, value] of Object.entries(req.headers)) {
+          const lk = key.toLowerCase();
+          if (lk === 'host' || lk === 'connection') continue;
+          if (lk === 'content-length') continue;
+          headers[key] = value;
+        }
+        headers['content-length'] = body.length;
+        headers['accept-encoding'] = 'identity';
+      } else {
+        let oauth;
+        try {
+          oauth = getToken(config.credsPath);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+          return;
+        }
 
-      headers['authorization'] = `Bearer ${oauth.accessToken}`;
-      headers['content-length'] = body.length;
-      headers['accept-encoding'] = 'identity';
+        for (const [key, value] of Object.entries(req.headers)) {
+          const lk = key.toLowerCase();
+          if (lk === 'host' || lk === 'connection') continue;
+          if (lk === 'authorization' || lk === 'x-api-key') continue;
+          if (lk === 'content-length') continue;
+          headers[key] = value;
+        }
 
-      // Merge required betas
-      const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) {
-        if (!betas.includes(b)) betas.push(b);
+        headers['authorization'] = `Bearer ${oauth.accessToken}`;
+        headers['content-length'] = body.length;
+        headers['accept-encoding'] = 'identity';
+
+        // Merge required betas
+        const existingBeta = headers['anthropic-beta'] || '';
+        const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
+        for (const b of REQUIRED_BETAS) {
+          if (!betas.includes(b)) betas.push(b);
+        }
+        headers['anthropic-beta'] = betas.join(',');
       }
-      headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${body.length}b)`);
@@ -391,19 +424,29 @@ function startServer(config) {
   });
 
   server.listen(config.port, '127.0.0.1', () => {
-    try {
-      const oauth = getToken(config.credsPath);
-      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
-      console.log(`\n  OpenClaw Billing Proxy`);
-      console.log(`  ---------------------`);
+    if (config.passthrough) {
+      console.log(`\n  OpenClaw Replacement Proxy (passthrough mode)`);
+      console.log(`  ----------------------------------------------`);
       console.log(`  Port:          ${config.port}`);
-      console.log(`  Subscription:  ${oauth.subscriptionType}`);
-      console.log(`  Token expires: ${h}h`);
+      console.log(`  Mode:          passthrough (headers forwarded as-is)`);
       console.log(`  Patterns:      ${config.replacements.length} sanitization + ${config.reverseMap.length} reverse`);
-      console.log(`  Credentials:   ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
-    } catch (e) {
-      console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
+    } else {
+      try {
+        const oauth = getToken(config.credsPath);
+        const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+        console.log(`\n  OpenClaw Billing Proxy`);
+        console.log(`  ---------------------`);
+        console.log(`  Port:          ${config.port}`);
+        console.log(`  Mode:          billing`);
+        console.log(`  Subscription:  ${oauth.subscriptionType}`);
+        console.log(`  Token expires: ${h}h`);
+        console.log(`  Patterns:      ${config.replacements.length} sanitization + ${config.reverseMap.length} reverse`);
+        console.log(`  Credentials:   ${config.credsPath}`);
+        console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+      } catch (e) {
+        console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
+      }
     }
   });
 
