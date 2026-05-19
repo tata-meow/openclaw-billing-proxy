@@ -748,6 +748,38 @@ function unmaskThinkingBlocks(m, masks) {
   return m;
 }
 
+// Strips all thinking/redacted_thinking content blocks from assistant messages
+// in the request body. OpenClaw re-serializes conversation history, which
+// changes the byte representation of thinking blocks. Anthropic requires these
+// blocks to be byte-identical to the original response if present — but does
+// NOT require them to be present at all. Stripping them is the only reliable
+// fix since the proxy can't undo OpenClaw's re-serialization. (issue #45)
+function stripThinkingBlocks(bodyStr) {
+  const msgsStart = bodyStr.indexOf('"messages":[');
+  if (msgsStart === -1) return bodyStr;
+  const arrayOpenIdx = msgsStart + '"messages":'.length;
+  const arrayCloseIdx = findMatchingBracket(bodyStr, arrayOpenIdx);
+  if (arrayCloseIdx === -1) return bodyStr;
+  const messagesJson = bodyStr.slice(arrayOpenIdx, arrayCloseIdx + 1);
+  let messages;
+  try { messages = JSON.parse(messagesJson); } catch (e) { return bodyStr; }
+  if (!Array.isArray(messages)) return bodyStr;
+
+  let stripped = 0;
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    const before = message.content.length;
+    message.content = message.content.filter(block =>
+      block.type !== 'thinking' && block.type !== 'redacted_thinking'
+    );
+    stripped += before - message.content.length;
+  }
+
+  if (stripped === 0) return bodyStr;
+  console.log(`[STRIP-THINKING] Removed ${stripped} thinking/redacted_thinking blocks from message history`);
+  return bodyStr.slice(0, arrayOpenIdx) + JSON.stringify(messages) + bodyStr.slice(arrayCloseIdx + 1);
+}
+
 // ─── Filesystem Path Protection ─────────────────────────────────────────────
 // Matches absolute paths with 2+ segments (e.g. /home/user/.openclaw/file.png)
 // and relative paths starting with ./ or ../ (e.g. ./src/openclaw/mod.js).
@@ -776,12 +808,17 @@ function processBody(bodyStr, config, reqPath) {
   // Must run on the original body (pre-masking) since masking corrupts JSON.parse.
   bodyStr = repairToolPairs(bodyStr);
 
+  // Strip thinking/redacted_thinking blocks from message history. OpenClaw
+  // re-serializes these, breaking byte-equality. Anthropic accepts messages
+  // without thinking blocks, so removing them is safer than trying to preserve
+  // corrupted ones. Must run before masking (needs JSON.parse on messages).
+  bodyStr = stripThinkingBlocks(bodyStr);
+
   // Extract original first user text for billing fingerprint BEFORE any transforms
   const originalFirstUserText = extractFirstUserText(bodyStr);
 
-  // Mask thinking/redacted_thinking content blocks from the transform pipeline
-  // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
-  // return. See "Thinking Block Protection" above.
+  // Mask any remaining thinking/redacted_thinking patterns (e.g. in system prompt)
+  // from the transform pipeline so Layer 2/3/6 split/join can't mutate them.
   const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
   let m = maskedBody;
 

@@ -21,7 +21,7 @@ new Function(...Object.keys(sandbox),
   this._test = {
     computeCch, computeBillingFingerprint, extractFirstUserText,
     getModelBetas, findMatchingBrace, findMatchingBracket, stripEffortFromObject,
-    repairToolPairs, maskThinkingBlocks, unmaskThinkingBlocks, reverseMap,
+    repairToolPairs, stripThinkingBlocks, maskThinkingBlocks, unmaskThinkingBlocks, reverseMap,
     filterStubsAgainstExisting, protectPaths, restorePaths,
     CONTEXT_AWARE_RENAMES, DEFAULT_TOOL_RENAMES, DEFAULT_REVERSE_MAP, DEFAULT_PROP_RENAMES,
     CC_TOOL_STUBS, REQUIRED_BETAS,
@@ -203,7 +203,58 @@ test('no messages key returns original', () => {
   assert.strictEqual(T.repairToolPairs(body), body);
 });
 
-// G. maskThinkingBlocks / unmaskThinkingBlocks
+// G. stripThinkingBlocks
+console.log('\n--- stripThinkingBlocks ---');
+test('strips thinking blocks from assistant messages', () => {
+  const body = JSON.stringify({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'internal reasoning', signature: 'sig123' },
+        { type: 'text', text: 'response' }
+      ]}
+    ]
+  });
+  const r = T.stripThinkingBlocks(body);
+  assert.ok(!r.includes('"thinking"'), 'thinking block should be stripped');
+  assert.ok(r.includes('"response"'), 'text block should remain');
+});
+test('strips redacted_thinking blocks', () => {
+  const body = JSON.stringify({
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'redacted_thinking', data: 'encrypted==' },
+        { type: 'text', text: 'hi' }
+      ]}
+    ]
+  });
+  const r = T.stripThinkingBlocks(body);
+  assert.ok(!r.includes('redacted_thinking'));
+  assert.ok(r.includes('"hi"'));
+});
+test('leaves user messages untouched', () => {
+  const body = JSON.stringify({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] }
+    ]
+  });
+  const r = T.stripThinkingBlocks(body);
+  assert.ok(r.includes('"hello"'));
+});
+test('no-op when no thinking blocks', () => {
+  const body = JSON.stringify({
+    messages: [
+      { role: 'assistant', content: [{ type: 'text', text: 'plain' }] }
+    ]
+  });
+  assert.strictEqual(T.stripThinkingBlocks(body), body);
+});
+test('no messages key returns original', () => {
+  const body = '{"model":"claude"}';
+  assert.strictEqual(T.stripThinkingBlocks(body), body);
+});
+
+// H. maskThinkingBlocks / unmaskThinkingBlocks
 console.log('\n--- maskThinkingBlocks ---');
 test('round-trip preserves content', () => {
   const orig = 'before {"type":"thinking","thinking":"secret"} after';
