@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.5';
+const VERSION = '2.3.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -48,16 +48,25 @@ const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
 
 // Beta flags required for OAuth + Claude Code features
+// 'advanced-tool-use-2025-11-20' and 'fast-mode-2026-02-01' removed — they don't
+// exist in real CC traffic and are density-classifier signals.
 const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
-  'advanced-tool-use-2025-11-20',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24',
-  'fast-mode-2026-02-01'
+  'effort-2025-11-24'
 ];
+
+function getModelBetas(model) {
+  const m = (model || '').toLowerCase();
+  return REQUIRED_BETAS.filter(b => {
+    if (b === 'interleaved-thinking-2025-05-14' && m.includes('haiku')) return false;
+    if (b === 'effort-2025-11-24' && !/-4-6\b/.test(m)) return false;
+    return true;
+  });
+}
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -123,11 +132,16 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
-function buildBillingBlock(bodyStr) {
-  const firstText = extractFirstUserText(bodyStr);
+function computeCch(text) {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 5);
+}
+
+function buildBillingBlock(bodyStr, preExtractedText) {
+  const firstText = preExtractedText !== undefined ? preExtractedText : extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+  const cch = computeCch(firstText);
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=${cch};"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
@@ -181,7 +195,6 @@ const DEFAULT_REPLACEMENTS = [
   ['billing-proxy', 'routing-layer'],
   ['x-anthropic-billing-header', 'x-routing-config'],
   ['x-anthropic-billing', 'x-routing-cfg'],
-  ['cch=00000', 'cfg=00000'],
   ['cc_version', 'rt_version'],
   ['cc_entrypoint', 'rt_entrypoint'],
   ['billing header', 'routing config'],
@@ -199,45 +212,57 @@ const DEFAULT_REPLACEMENTS = [
 // Renaming to PascalCase CC-like conventions defeats this entirely.
 //
 // ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
+// Tool renames are split into two categories:
+//   CC-native: renamed to real CC tool names (no prefix) — these make the tool
+//     set look like a genuine Claude Code session.
+//   Non-CC: renamed with mcp_ prefix — these look like user-provided MCP tools,
+//     which is what Anthropic expects alongside CC-native ones.
+//
+// CONTEXT-AWARE RENAMES: entries listed in CONTEXT_AWARE_RENAMES use targeted
+// "name":"X" replacement instead of global "X" to avoid renaming parameter names
+// that collide with the tool name (e.g. the 'message' tool has a 'message' param).
+//
+// ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
+const CONTEXT_AWARE_RENAMES = new Set(['message']);
 const DEFAULT_TOOL_RENAMES = [
+  // CC-native (real CC tool names, no prefix)
   ['exec', 'Bash'],
-  ['process', 'BashSession'],
-  ['browser', 'BrowserControl'],
-  ['canvas', 'CanvasView'],
   ['nodes', 'DeviceControl'],
-  ['cron', 'Scheduler'],
-  ['message', 'SendMessage'],
-  ['tts', 'Speech'],
-  ['gateway', 'SystemCtl'],
-  ['agents_list', 'AgentList'],
-  ['list_tasks', 'TaskList'],
-  ['get_history', 'TaskHistory'],
-  ['send_to_task', 'TaskSend'],
-  ['create_task', 'TaskCreate'],
-  ['subagents', 'AgentControl'],
-  ['session_status', 'StatusCheck'],
-  ['web_search', 'WebSearch'],
-  ['web_fetch', 'WebFetch'],
+  // Non-CC (mcp_ prefix to look like MCP user tools)
+  ['process', 'mcp_BashSession'],
+  ['browser', 'mcp_BrowserControl'],
+  ['canvas', 'mcp_CanvasView'],
+  ['cron', 'mcp_Scheduler'],
+  ['message', 'mcp_SendMessage'],
+  ['tts', 'mcp_Speech'],
+  ['gateway', 'mcp_SystemCtl'],
+  ['agents_list', 'mcp_AgentList'],
+  ['list_tasks', 'mcp_TaskList'],
+  ['get_history', 'mcp_TaskHistory'],
+  ['send_to_task', 'mcp_TaskSend'],
+  ['create_task', 'mcp_TaskCreate'],
+  ['subagents', 'mcp_AgentControl'],
+  ['session_status', 'mcp_StatusCheck'],
+  // NOTE: web_search, web_fetch removed — these are Anthropic built-in tool types.
+  // Renaming them corrupts the "type" field and Anthropic rejects with:
+  //   Input tag 'WebSearch' found using 'type' does not match expected tags
+  // Same class of bug as the 'image' collision (issue #14).
+  //
   // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
-  // type "image". OpenClaw tool_results carrying image content blocks would have
-  // their `"type": "image"` field renamed and Anthropic rejects with:
-  //   messages.N.content.M.tool_result.content.K: Input tag 'ImageGen' found
-  //   using 'type' does not match any of the expected tags
-  // The fingerprint signal lost from one tool name is much smaller than the
-  // certainty of breaking every conversation that ever touched an image. (issue #14)
-  ['pdf', 'PdfParse'],
-  ['image_generate', 'ImageCreate'],
-  ['music_generate', 'MusicCreate'],
-  ['video_generate', 'VideoCreate'],
-  ['memory_search', 'KnowledgeSearch'],
-  ['memory_get', 'KnowledgeGet'],
-  ['lcm_expand_query', 'ContextQuery'],
-  ['lcm_grep', 'ContextGrep'],
-  ['lcm_describe', 'ContextDescribe'],
-  ['lcm_expand', 'ContextExpand'],
-  ['yield_task', 'TaskYield'],
-  ['task_store', 'TaskStore'],
-  ['task_yield_interrupt', 'TaskYieldInterrupt']
+  // type "image". (issue #14)
+  ['pdf', 'mcp_PdfParse'],
+  ['image_generate', 'mcp_ImageCreate'],
+  ['music_generate', 'mcp_MusicCreate'],
+  ['video_generate', 'mcp_VideoCreate'],
+  ['memory_search', 'mcp_KnowledgeSearch'],
+  ['memory_get', 'mcp_KnowledgeGet'],
+  ['lcm_expand_query', 'mcp_ContextQuery'],
+  ['lcm_grep', 'mcp_ContextGrep'],
+  ['lcm_describe', 'mcp_ContextDescribe'],
+  ['lcm_expand', 'mcp_ContextExpand'],
+  ['yield_task', 'mcp_TaskYield'],
+  ['task_store', 'mcp_TaskStore'],
+  ['task_yield_interrupt', 'mcp_TaskYieldInterrupt']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -255,8 +280,6 @@ const DEFAULT_PROP_RENAMES = [
 
 // ─── Reverse Mappings ───────────────────────────────────────────────────────
 const DEFAULT_REVERSE_MAP = [
-  ['OCPlatform', 'OpenClaw'],
-  ['ocplatform', 'openclaw'],
   ['create_task', 'sessions_spawn'],
   ['list_tasks', 'sessions_list'],
   ['get_history', 'sessions_history'],
@@ -278,11 +301,13 @@ const DEFAULT_REVERSE_MAP = [
   ['routing-layer', 'billing-proxy'],
   ['x-routing-config', 'x-anthropic-billing-header'],
   ['x-routing-cfg', 'x-anthropic-billing'],
-  ['cfg=00000', 'cch=00000'],
   ['rt_version', 'cc_version'],
   ['rt_entrypoint', 'cc_entrypoint'],
   ['routing config', 'billing header'],
-  ['usage quota', 'extra usage']
+  ['usage quota', 'extra usage'],
+  // OCPlatform/ocplatform must come AFTER more specific patterns above
+  ['OCPlatform', 'OpenClaw'],
+  ['ocplatform', 'openclaw']
 ];
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -409,6 +434,7 @@ function loadConfig() {
     replacements,
     reverseMap,
     toolRenames,
+    contextAwareRenames: CONTEXT_AWARE_RENAMES,
     propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
@@ -452,6 +478,93 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// String-aware brace matching: counterpart to findMatchingBracket for {/}.
+function findMatchingBrace(str, start) {
+  let d = 0, inStr = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') d++;
+    else if (c === '}') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+// Filter CC_TOOL_STUBS to only those whose name isn't already present in the
+// tools section JSON. Prevents Anthropic's "Tool names must be unique" error.
+function filterStubsAgainstExisting(stubs, toolsSection) {
+  const existingNames = new Set();
+  const nameRe = /"name":"([^"]+)"/g;
+  let match;
+  while ((match = nameRe.exec(toolsSection)) !== null) {
+    existingNames.add(match[1].toLowerCase());
+  }
+  return stubs.filter((stubJson) => {
+    const m = /"name":"([^"]+)"/.exec(stubJson);
+    return m ? !existingNames.has(m[1].toLowerCase()) : true;
+  });
+}
+
+// Removes orphaned tool_use / tool_result blocks from conversation history.
+// An orphaned tool_use has no matching tool_result; an orphaned tool_result
+// has no matching tool_use. Both cause Anthropic API validation errors.
+function repairToolPairs(bodyStr) {
+  const msgsStart = bodyStr.indexOf('"messages":[');
+  if (msgsStart === -1) return bodyStr;
+  const arrayOpenIdx = msgsStart + '"messages":'.length;
+  const arrayCloseIdx = findMatchingBracket(bodyStr, arrayOpenIdx);
+  if (arrayCloseIdx === -1) return bodyStr;
+  const messagesJson = bodyStr.slice(arrayOpenIdx, arrayCloseIdx + 1);
+  let messages;
+  try { messages = JSON.parse(messagesJson); } catch (e) { return bodyStr; }
+  if (!Array.isArray(messages)) return bodyStr;
+  const toolUseIds = new Set();
+  const toolResultIds = new Set();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string') toolUseIds.add(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') toolResultIds.add(block.tool_use_id);
+    }
+  }
+  const orphanedUses = new Set();
+  for (const id of toolUseIds) if (!toolResultIds.has(id)) orphanedUses.add(id);
+  const orphanedResults = new Set();
+  for (const id of toolResultIds) if (!toolUseIds.has(id)) orphanedResults.add(id);
+  if (orphanedUses.size === 0 && orphanedResults.size === 0) return bodyStr;
+  console.log(`[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
+  const candidateRepaired = messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const filtered = message.content.filter((block) => {
+      if (block.type === 'tool_use' && typeof block.id === 'string') return !orphanedUses.has(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') return !orphanedResults.has(block.tool_use_id);
+      return true;
+    });
+    if (filtered.length === 0) return null;
+    return { ...message, content: filtered };
+  });
+  const repaired = [];
+  for (let i = 0; i < candidateRepaired.length; i++) {
+    if (candidateRepaired[i] !== null) {
+      repaired.push(candidateRepaired[i]);
+    } else {
+      const prevRole = repaired.length > 0 ? repaired[repaired.length - 1].role : null;
+      const nextMsg = candidateRepaired.slice(i + 1).find(m => m !== null);
+      const nextRole = nextMsg ? nextMsg.role : null;
+      if (prevRole && nextRole && prevRole === nextRole) {
+        repaired.push({ ...messages[i], content: [{ type: 'text', text: '(removed)' }] });
+      }
+    }
+  }
+  const repairedJson = JSON.stringify(repaired);
+  return bodyStr.slice(0, arrayOpenIdx) + repairedJson + bodyStr.slice(arrayCloseIdx + 1);
+}
+
 // ─── Thinking Block Protection ──────────────────────────────────────────────
 // Anthropic requires thinking/redacted_thinking content blocks to be echoed
 // back byte-identical to what the model originally produced; any mutation
@@ -467,45 +580,45 @@ function findMatchingBracket(str, start) {
 // or rename pattern can match it.
 const THINK_MASK_PREFIX = '__OBP_THINK_MASK_';
 const THINK_MASK_SUFFIX = '__';
-const THINK_BLOCK_PATTERNS = ['{"type":"thinking"', '{"type":"redacted_thinking"'];
 
+// Finds thinking/redacted_thinking content blocks regardless of JSON formatting
+// (key order, whitespace). Handles cases where client re-serializes thinking
+// blocks differently from Anthropic's compact format — e.g. with spaces after
+// colons, or with 'type' not being the first key.
 function maskThinkingBlocks(m) {
   const masks = [];
-  let out = '';
-  let i = 0;
-  while (i < m.length) {
-    let nextIdx = -1;
-    for (const p of THINK_BLOCK_PATTERNS) {
-      const idx = m.indexOf(p, i);
-      if (idx !== -1 && (nextIdx === -1 || idx < nextIdx)) nextIdx = idx;
-    }
-    if (nextIdx === -1) { out += m.slice(i); break; }
-    out += m.slice(i, nextIdx);
-    // String-aware bracket scan so braces inside the thinking text value
-    // don't corrupt the depth count.
-    let depth = 0, inStr = false, j = nextIdx;
-    while (j < m.length) {
-      const c = m[j];
-      if (inStr) {
-        if (c === '\\') { j += 2; continue; }
-        if (c === '"') inStr = false;
-        j++;
-        continue;
+  const TYPE_RE = /"type"\s*:\s*"(?:thinking|redacted_thinking)"/g;
+  const positions = [];
+  let match;
+  while ((match = TYPE_RE.exec(m)) !== null) {
+    // Scan backward to find the enclosing '{'. Skip balanced {/} pairs.
+    // For content array elements, the first unmatched '{' is the object start.
+    let depth = 0, objStart = -1;
+    for (let j = match.index - 1; j >= 0; j--) {
+      if (m[j] === '}') depth++;
+      else if (m[j] === '{') {
+        if (depth === 0) { objStart = j; break; }
+        depth--;
       }
-      if (c === '"') { inStr = true; j++; continue; }
-      if (c === '{') { depth++; j++; continue; }
-      if (c === '}') { depth--; j++; if (depth === 0) break; continue; }
-      j++;
     }
-    if (depth !== 0) {
-      // Malformed / truncated — bail without masking the rest
-      out += m.slice(nextIdx);
-      return { masked: out, masks };
-    }
-    masks.push(m.slice(nextIdx, j));
-    out += THINK_MASK_PREFIX + (masks.length - 1) + THINK_MASK_SUFFIX;
-    i = j;
+    if (objStart === -1) continue;
+    // Forward-scan from objStart with string-aware brace matching
+    const objEnd = findMatchingBrace(m, objStart);
+    if (objEnd === -1) continue;
+    positions.push({ start: objStart, end: objEnd + 1 });
   }
+  if (positions.length === 0) return { masked: m, masks };
+  positions.sort((a, b) => a.start - b.start);
+  let out = '';
+  let lastEnd = 0;
+  for (const pos of positions) {
+    if (pos.start < lastEnd) continue;
+    out += m.slice(lastEnd, pos.start);
+    masks.push(m.slice(pos.start, pos.end));
+    out += THINK_MASK_PREFIX + (masks.length - 1) + THINK_MASK_SUFFIX;
+    lastEnd = pos.end;
+  }
+  out += m.slice(lastEnd);
   return { masked: out, masks };
 }
 
@@ -539,7 +652,14 @@ function restorePaths(str, saved) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-function processBody(bodyStr, config) {
+function processBody(bodyStr, config, reqPath) {
+  // Repair orphaned tool_use/tool_result pairs before any transforms.
+  // Must run on the original body (pre-masking) since masking corrupts JSON.parse.
+  bodyStr = repairToolPairs(bodyStr);
+
+  // Extract original first user text for billing fingerprint BEFORE any transforms
+  const originalFirstUserText = extractFirstUserText(bodyStr);
+
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
   // return. See "Thinking Block Protection" above.
@@ -562,8 +682,15 @@ function processBody(bodyStr, config) {
   m = restorePaths(m, savedPaths);
 
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
+  // Context-aware renames (e.g. 'message') only replace "name":"X" positions
+  // to avoid renaming parameter names that collide with the tool name.
   for (const [orig, cc] of config.toolRenames) {
-    m = m.split('"' + orig + '"').join('"' + cc + '"');
+    if (config.contextAwareRenames.has(orig)) {
+      m = m.split('"name":"' + orig + '"').join('"name":"' + cc + '"');
+      m = m.split('"name": "' + orig + '"').join('"name": "' + cc + '"');
+    } else {
+      m = m.split('"' + orig + '"').join('"' + cc + '"');
+    }
   }
 
   // Layer 6: Property name renaming
@@ -639,25 +766,36 @@ function processBody(bodyStr, config) {
           section = section.slice(0, vs) + section.slice(i);
           from = vs + 1;
         }
-        // Inject CC tool stubs
+        // Inject CC tool stubs (dedup against existing tool names)
         if (config.injectCCStubs) {
-          const insertAt = '"tools":['.length;
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+          const stubsToInject = filterStubsAgainstExisting(CC_TOOL_STUBS, section);
+          if (stubsToInject.length > 0) {
+            const insertAt = '"tools":['.length;
+            section = section.slice(0, insertAt) + stubsToInject.join(',') + ',' + section.slice(insertAt);
+          }
         }
         m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
       }
     }
   } else if (config.injectCCStubs) {
-    // Inject stubs even without description stripping
+    // Inject stubs even without description stripping (dedup against existing)
     const toolsIdx = m.indexOf('"tools":[');
     if (toolsIdx !== -1) {
-      const insertAt = toolsIdx + '"tools":['.length;
-      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+      const toolsEndIdx = findMatchingBracket(m, toolsIdx + '"tools":'.length);
+      if (toolsEndIdx !== -1) {
+        const section = m.slice(toolsIdx, toolsEndIdx + 1);
+        const stubsToInject = filterStubsAgainstExisting(CC_TOOL_STUBS, section);
+        if (stubsToInject.length > 0) {
+          const insertAt = toolsIdx + '"tools":['.length;
+          m = m.slice(0, insertAt) + stubsToInject.join(',') + ',' + m.slice(insertAt);
+        }
+      }
     }
   }
 
   // Layer 1: Billing header injection (dynamic fingerprint per request)
-  const BILLING_BLOCK = buildBillingBlock(m);
+  // Uses original user text (pre-transform) so CCH hash is stable.
+  const BILLING_BLOCK = buildBillingBlock(m, originalFirstUserText);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
@@ -679,22 +817,38 @@ function processBody(bodyStr, config) {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
-  // Metadata injection: device_id + session_id matching real CC format
-  // Uses raw string manipulation to inject/replace metadata field
-  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
-  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
-  const existingMeta = m.indexOf('"metadata":{');
-  if (existingMeta !== -1) {
-    // Find end of existing metadata object
-    let depth = 0, mi = existingMeta + '"metadata":'.length;
-    for (; mi < m.length; mi++) {
-      if (m[mi] === '{') depth++;
-      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+  // Metadata injection: device_id + session_id matching real CC format.
+  // Restricted to /v1/messages — count_tokens and other sub-endpoints reject
+  // the metadata field ("Extra inputs are not permitted").
+  if (reqPath === '/v1/messages' || reqPath === '/v1/messages/') {
+    const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+    const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+    const existingMeta = m.indexOf('"metadata":{');
+    if (existingMeta !== -1) {
+      let depth = 0, mi = existingMeta + '"metadata":'.length;
+      for (; mi < m.length; mi++) {
+        if (m[mi] === '{') depth++;
+        else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+      }
+      m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+    } else {
+      m = '{' + metaJson + ',' + m.slice(1);
     }
-    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
   } else {
-    // Insert after opening brace
-    m = '{' + metaJson + ',' + m.slice(1);
+    // Strip any stale metadata the client may have sent on non-messages endpoints
+    const existingMeta = m.indexOf('"metadata":{');
+    if (existingMeta !== -1) {
+      let depth = 0, mi = existingMeta + '"metadata":'.length;
+      for (; mi < m.length; mi++) {
+        if (m[mi] === '{') depth++;
+        else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+      }
+      let end = mi;
+      if (m[end] === ',') end++;
+      let start = existingMeta;
+      if (start > 0 && m[start - 1] === ',') start--;
+      m = m.slice(0, start) + m.slice(end);
+    }
   }
 
   // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
@@ -751,9 +905,10 @@ function reverseMap(text, config) {
   // Reverse tool names first (more specific patterns).
   // Handle BOTH plain ("Name") AND escaped (\"Name\") forms.
   // SSE input_json_delta embeds tool args in a partial_json string field where
-  // inner quotes are escaped. Without the escaped variant, renamed arg keys
-  // like \"SendMessage\" never get reverted to \"message\" and OpenClaw's tool
-  // runtime fails with "message required". (issue #11)
+  // inner quotes are escaped.
+  // Context-aware renames (e.g. 'message') only replaced "name":"X" on the
+  // forward pass, so only the tool name needs reversal — but the mcp_ prefixed
+  // name is unique enough that global replacement is safe here.
   for (const [orig, cc] of config.toolRenames) {
     r = r.split('"' + cc + '"').join('"' + orig + '"');
     r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
@@ -821,7 +976,7 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      bodyStr = processBody(bodyStr, config);
+      bodyStr = processBody(bodyStr, config, (req.url || '').split('?')[0]);
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -843,9 +998,14 @@ function startServer(config) {
         headers[k] = v;
       }
 
+      // Per-model beta filtering: skip interleaved-thinking for Haiku,
+      // skip effort for non-4.6 models.
+      const modelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+      const modelName = modelMatch ? modelMatch[1] : '';
+      const modelBetas = getModelBetas(modelName);
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
+      for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
