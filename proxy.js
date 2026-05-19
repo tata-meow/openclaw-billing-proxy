@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -67,6 +67,13 @@ function getModelBetas(model) {
     return true;
   });
 }
+
+// OAuth token cache (for refresh support)
+const OAUTH_TOKEN_URL = 'https://claude.ai/v1/oauth/token';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+let _cachedToken = null;
+let _credsFilePath = null;
+let _refreshPromise = null;
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -157,7 +164,7 @@ function getStainlessHeaders() {
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.81.0',
+    'x-stainless-package-version': '0.90.0',
     'x-stainless-runtime': 'node',
     'x-stainless-runtime-version': process.version,
     'x-stainless-retry-count': '0',
@@ -428,6 +435,8 @@ function loadConfig() {
     console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
   }
 
+  _credsFilePath = credsPath;
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
@@ -438,7 +447,7 @@ function loadConfig() {
     propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false,
+    injectCCStubs: config.injectCCStubs === true,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
@@ -457,6 +466,91 @@ function getToken(credsPath) {
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
   return oauth;
+}
+
+async function refreshOAuthToken(refreshToken) {
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: OAUTH_CLIENT_ID,
+    refresh_token: refreshToken,
+  }).toString();
+
+  const res = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  if (!res.ok) throw new Error(`Token refresh HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Token refresh: no access_token in response');
+
+  const newToken = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token ?? refreshToken,
+    expiresAt: Date.now() + (data.expires_in ?? 36000) * 1000,
+    subscriptionType: _cachedToken?.subscriptionType ?? 'unknown',
+  };
+
+  _cachedToken = newToken;
+
+  if (_credsFilePath && _credsFilePath !== 'env') {
+    try {
+      let raw = fs.readFileSync(_credsFilePath, 'utf8');
+      if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+      const creds = JSON.parse(raw);
+      creds.claudeAiOauth = {
+        ...creds.claudeAiOauth,
+        accessToken: newToken.accessToken,
+        refreshToken: newToken.refreshToken,
+        expiresAt: newToken.expiresAt,
+      };
+      fs.writeFileSync(_credsFilePath, JSON.stringify(creds, null, 2), 'utf8');
+      console.log('[OAUTH] Refreshed token written back to credentials file.');
+    } catch (writeErr) {
+      console.warn('[OAUTH] Could not write refreshed token to file:', writeErr.message);
+    }
+  }
+
+  console.log(`[OAUTH] Token refreshed. Expires in ${Math.round((data.expires_in ?? 36000) / 3600)}h.`);
+  return newToken;
+}
+
+async function getTokenAsync(credsPath) {
+  if (credsPath === 'env') return getToken(credsPath);
+
+  if (_cachedToken && (_cachedToken.expiresAt - Date.now()) > 5 * 60 * 1000) {
+    return _cachedToken;
+  }
+
+  let raw = fs.readFileSync(credsPath, 'utf8');
+  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+  const creds = JSON.parse(raw);
+  const oauth = creds.claudeAiOauth;
+  if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+
+  _cachedToken = {
+    accessToken: oauth.accessToken,
+    refreshToken: oauth.refreshToken,
+    expiresAt: oauth.expiresAt ?? Infinity,
+    subscriptionType: oauth.subscriptionType ?? 'unknown',
+  };
+
+  const timeRemaining = (_cachedToken.expiresAt - Date.now());
+  if (timeRemaining < 5 * 60 * 1000 && _cachedToken.refreshToken) {
+    if (!_refreshPromise) {
+      console.log('[OAUTH] Token expiring soon, refreshing...');
+      _refreshPromise = refreshOAuthToken(_cachedToken.refreshToken)
+        .finally(() => { _refreshPromise = null; });
+    }
+    try {
+      _cachedToken = await _refreshPromise;
+    } catch (refreshErr) {
+      console.warn('[OAUTH] Refresh failed, using existing token:', refreshErr.message);
+    }
+  }
+
+  return _cachedToken;
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -493,6 +587,31 @@ function findMatchingBrace(str, start) {
     else if (c === '}') { d--; if (d === 0) return i; }
   }
   return -1;
+}
+
+// Strips "effort" key-value from a JSON object identified by objectKey.
+// Haiku models reject effort params with 400; this removes them safely.
+function stripEffortFromObject(str, objectKey) {
+  const keyPattern = '"' + objectKey + '"';
+  let pos = str.indexOf(keyPattern);
+  if (pos === -1) return str;
+  let braceStart = str.indexOf('{', pos + keyPattern.length);
+  if (braceStart === -1) return str;
+  const braceEnd = findMatchingBrace(str, braceStart);
+  if (braceEnd === -1) return str;
+  const inner = str.slice(braceStart + 1, braceEnd);
+  let cleaned = inner
+    .replace(/,\s*"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null)/, '')
+    .replace(/"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null),?\s*/, '');
+  cleaned = cleaned.replace(/,\s*$/, '').trim();
+  if (cleaned === '') {
+    const keyStart = str.lastIndexOf(',', pos);
+    if (keyStart !== -1 && str.slice(keyStart, pos).trim() === ',') {
+      return str.slice(0, keyStart) + str.slice(braceEnd + 1);
+    }
+    return str.slice(0, pos) + str.slice(braceEnd + 1);
+  }
+  return str.slice(0, braceStart + 1) + cleaned + str.slice(braceEnd);
 }
 
 // Filter CC_TOOL_STUBS to only those whose name isn't already present in the
@@ -681,6 +800,16 @@ function processBody(bodyStr, config, reqPath) {
   // Restore protected filesystem paths
   m = restorePaths(m, savedPaths);
 
+  // Layer 2.5: Strip effort param for Haiku models (Haiku rejects effort with 400)
+  {
+    const modelMatch = /"model"\s*:\s*"([^"]+)"/.exec(m);
+    if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
+      m = stripEffortFromObject(m, 'output_config');
+      m = stripEffortFromObject(m, 'thinking');
+      console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
+    }
+  }
+
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
   // Context-aware renames (e.g. 'message') only replace "name":"X" positions
   // to avoid renaming parameter names that collide with the tool name.
@@ -701,33 +830,73 @@ function processBody(bodyStr, config, reqPath) {
   // Layer 4: System prompt template bypass
   // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
   // and replace with a brief paraphrase. The config is between the identity line
-  // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
+  // and the first workspace doc header (filesystem path).
   // IMPORTANT: Search WITHIN the system array, not from the start of the body.
   // The identity line can appear in conversation history (from prior discussions),
   // and matching there instead of the system prompt causes the strip to fail.
+  //
+  // Multi-marker detection: OpenClaw identity text varies by config. Try all known
+  // variants in order of specificity. The first match wins.
   if (config.stripSystemConfig) {
-    const IDENTITY_MARKER = 'You are a personal assistant';
-    // Anchor search to the system array so we don't match conversation history
+    const IDENTITY_MARKERS = [
+      'You are a personal assistant',
+      'You are an AI assistant',
+      'You are a helpful assistant',
+      'You are an intelligent assistant',
+      'You are an AI agent',
+      'You are an agent',
+    ];
+
+    const END_BOUNDARY_PATTERNS = [
+      '\\n## /',
+      '\\n## \\\\\\\\',
+      '\\n## //',
+    ];
+
     const sysArrayStart = m.indexOf('"system":[');
+    let sysArrayEnd = -1;
+    if (sysArrayStart !== -1) {
+      sysArrayEnd = findMatchingBracket(m, sysArrayStart + '"system":'.length);
+    }
     const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
-    const configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
+    const searchTo = sysArrayEnd !== -1 ? sysArrayEnd : m.length;
+
+    let configStart = -1;
+    let matchedMarker = '';
+    for (const marker of IDENTITY_MARKERS) {
+      const idx = m.indexOf(marker, searchFrom);
+      if (idx !== -1 && idx < searchTo) {
+        configStart = idx;
+        matchedMarker = marker;
+        break;
+      }
+    }
+
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header (a ## section with a filesystem path).
-      // Previous approach used 'AGENTS.md' as the landmark, but that string can appear
-      // earlier in skill content or LCM summaries, causing a premature boundary. (issue #26)
-      // Workspace doc headers always start with a filesystem path:
-      //   Linux/macOS: \n## /home/... or \n## /Users/...
-      //   Windows:     \n## C:\\...
-      let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
-      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
-      if (configEnd !== -1) {
-        const boundary = configEnd;
 
-        const strippedLen = boundary - stripFrom;
+      let configEnd = -1;
+      const searchAfter = configStart + matchedMarker.length;
+      for (const pat of END_BOUNDARY_PATTERNS) {
+        const idx = m.indexOf(pat, searchAfter);
+        if (idx !== -1 && (configEnd === -1 || idx < configEnd)) {
+          configEnd = idx;
+        }
+      }
+      {
+        const winPattern = /\\n## [A-Z]:\\\\/g;
+        winPattern.lastIndex = searchAfter;
+        const wm = winPattern.exec(m);
+        if (wm !== null && (configEnd === -1 || wm.index < configEnd)) {
+          configEnd = wm.index;
+        }
+      }
+
+      if (configEnd !== -1) {
+        const strippedLen = configEnd - stripFrom;
         if (strippedLen > 1000) {
           const PARAPHRASE =
             '\\nYou are an AI operations assistant with access to all tools listed in this request ' +
@@ -738,9 +907,11 @@ function processBody(bodyStr, config, reqPath) {
             'Skills defined in your workspace should be invoked when they match user requests. ' +
             'Consult your workspace reference files for detailed operational configuration.\\n';
 
-          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
-          console.log(`[STRIP] Removed ${strippedLen} chars of config template`);
+          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(configEnd);
+          console.log(`[STRIP] Removed ${strippedLen} chars of config template (marker: "${matchedMarker}")`);
         }
+      } else {
+        console.warn(`[STRIP] Layer 4: identity marker found ("${matchedMarker}") but no end boundary detected — skipping strip to preserve body integrity`);
       }
     }
   }
@@ -933,8 +1104,8 @@ function startServer(config) {
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
       try {
-        const oauth = getToken(config.credsPath);
-        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        const tokenInfo = _cachedToken || getToken(config.credsPath);
+        const expiresIn = (tokenInfo.expiresAt - Date.now()) / 3600000;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
@@ -943,7 +1114,8 @@ function startServer(config) {
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
-          subscriptionType: oauth.subscriptionType,
+          tokenCached: !!_cachedToken,
+          subscriptionType: tokenInfo.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
             toolNameRenames: config.toolRenames.length,
@@ -965,10 +1137,10 @@ function startServer(config) {
     const chunks = [];
 
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       let body = Buffer.concat(chunks);
       let oauth;
-      try { oauth = getToken(config.credsPath); } catch (e) {
+      try { oauth = await getTokenAsync(config.credsPath); } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
         return;
@@ -1017,6 +1189,10 @@ function startServer(config) {
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
+        if (status === 401) {
+          console.warn(`[${ts}] #${reqNum} Got 401 from Anthropic — forcing token cache invalidation.`);
+          _cachedToken = null;
+        }
         if (status !== 200 && status !== 201) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
