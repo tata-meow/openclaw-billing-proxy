@@ -1141,7 +1141,7 @@ function startServer(config) {
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
       try {
-        const tokenInfo = _cachedToken || getToken(config.credsPath);
+        const tokenInfo = getToken(config.credsPath);
         const expiresIn = (tokenInfo.expiresAt - Date.now()) / 3600000;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
