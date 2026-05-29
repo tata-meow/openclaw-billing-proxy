@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.5.0 -- 2026-05-29
+
+### Structured request logging: local-time ISO timestamps, per-request correlation, param summary
+
+**Changes:**
+- All per-request log lines now use a local-time ISO 8601 timestamp with millisecond
+  precision and an explicit timezone offset (e.g. `[2026-05-29T11:39:13.150+08:00]`)
+  instead of the previous UTC `HH:MM:SS`. Timestamps are generated per log line, so a
+  request line and its `> 200` response line reflect their real wall-clock times.
+- Every transform log (`[REPAIR]`, `[STRIP-THINKING]`, `[EFFORT]`, `[STRIP]`,
+  `[STRIP-PREFILL]`) is now prefixed with the timestamp and the request number
+  (`#<n>`), so all log lines for one request can be correlated. `reqNum` is threaded
+  through `processBody` → `repairToolPairs` / `stripThinkingBlocks`.
+- New `params:` line per request summarizing the request actually sent upstream:
+  `model`, `effort`, `thinking` (budget_tokens), `max_tokens`, `stream`, `tools`
+  (count), `msgs` (count), and the applied `betas`.
+- New helpers: `tsLocal()`, `plog(reqNum, msg, level)`, `summarizeParams(bodyStr, betas)`.
+
+**Why:**
+The previous logs used UTC times with no date and no per-request prefix on the
+transform lines, making it hard to read logs in the operator's own timezone and hard
+to tell which `[STRIP]`/`[STRIP-THINKING]` lines belonged to which request. The param
+summary surfaces the key knobs (model, effort, thinking budget, betas) at a glance —
+the summary is parsed from the *processed* body, so model-specific transforms (e.g.
+Haiku effort stripping) are reflected accurately.
+
+---
+
 ## v2.2.5 -- 2026-04-10
 
 ### Protect filesystem paths from Layer 2 global string replacement
