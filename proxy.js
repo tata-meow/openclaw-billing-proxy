@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.4.0';
+const VERSION = '2.5.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -46,6 +46,65 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
+
+// ─── Logging helpers ──────────────────────────────────────────────────────────
+// Local-time ISO 8601 timestamp with millisecond precision and timezone offset,
+// e.g. "2026-05-29T11:00:00.123+08:00". Uses the system timezone (not UTC) so
+// logs read naturally for whoever runs the proxy, while the explicit offset keeps
+// them unambiguous across machines/timezones.
+function tsLocal() {
+  const d = new Date();
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  const off = -d.getTimezoneOffset(); // minutes east of UTC (+480 for UTC+8)
+  const sign = off >= 0 ? '+' : '-';
+  const abs = Math.abs(off);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}` +
+    `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
+// Per-request log line: "[<ts>] #<reqNum> <msg>". reqNum may be null for logs not
+// tied to a specific request. level is 'log' | 'warn' | 'error'.
+function plog(reqNum, msg, level = 'log') {
+  const prefix = reqNum != null ? `[${tsLocal()}] #${reqNum}` : `[${tsLocal()}]`;
+  console[level](`${prefix} ${msg}`);
+}
+
+// Build a compact one-line summary of the request params actually being sent
+// upstream, e.g. "model=claude-opus-4-8 effort=high thinking=10000 max_tokens=32000
+// stream=true tools=14 msgs=42 betas=oauth-2025-04-20,...". Parses the processed
+// body so stripped fields (e.g. Haiku effort) are reflected accurately. Falls back
+// to regex extraction if the body isn't valid JSON for any reason.
+function summarizeParams(bodyStr, betas) {
+  const parts = [];
+  let p = null;
+  try { p = JSON.parse(bodyStr); } catch (e) { p = null; }
+  if (p && typeof p === 'object') {
+    if (p.model) parts.push(`model=${p.model}`);
+    const effort = (p.output_config && p.output_config.effort) ??
+      (p.thinking && p.thinking.effort);
+    if (effort != null) parts.push(`effort=${effort}`);
+    if (p.thinking && p.thinking.budget_tokens != null) parts.push(`thinking=${p.thinking.budget_tokens}`);
+    if (p.max_tokens != null) parts.push(`max_tokens=${p.max_tokens}`);
+    if (p.stream != null) parts.push(`stream=${p.stream}`);
+    if (Array.isArray(p.tools)) parts.push(`tools=${p.tools.length}`);
+    if (Array.isArray(p.messages)) parts.push(`msgs=${p.messages.length}`);
+  } else {
+    const g = (re) => { const m = re.exec(bodyStr); return m ? m[1] : null; };
+    const model = g(/"model"\s*:\s*"([^"]+)"/);
+    if (model) parts.push(`model=${model}`);
+    const effort = g(/"effort"\s*:\s*"([^"]+)"/);
+    if (effort) parts.push(`effort=${effort}`);
+    const budget = g(/"budget_tokens"\s*:\s*(\d+)/);
+    if (budget) parts.push(`thinking=${budget}`);
+    const maxTokens = g(/"max_tokens"\s*:\s*(\d+)/);
+    if (maxTokens) parts.push(`max_tokens=${maxTokens}`);
+    const stream = g(/"stream"\s*:\s*(true|false)/);
+    if (stream) parts.push(`stream=${stream}`);
+  }
+  if (betas && betas.length) parts.push(`betas=${betas.join(',')}`);
+  return parts.join(' ');
+}
 
 // Beta flags required for OAuth + Claude Code features
 // 'advanced-tool-use-2025-11-20' and 'fast-mode-2026-02-01' removed — they don't
@@ -632,7 +691,7 @@ function filterStubsAgainstExisting(stubs, toolsSection) {
 // Removes orphaned tool_use / tool_result blocks from conversation history.
 // An orphaned tool_use has no matching tool_result; an orphaned tool_result
 // has no matching tool_use. Both cause Anthropic API validation errors.
-function repairToolPairs(bodyStr) {
+function repairToolPairs(bodyStr, reqNum) {
   const msgsStart = bodyStr.indexOf('"messages":[');
   if (msgsStart === -1) return bodyStr;
   const arrayOpenIdx = msgsStart + '"messages":'.length;
@@ -656,7 +715,7 @@ function repairToolPairs(bodyStr) {
   const orphanedResults = new Set();
   for (const id of toolResultIds) if (!toolUseIds.has(id)) orphanedResults.add(id);
   if (orphanedUses.size === 0 && orphanedResults.size === 0) return bodyStr;
-  console.log(`[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
+  plog(reqNum, `[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
   const candidateRepaired = messages.map((message) => {
     if (!Array.isArray(message.content)) return message;
     const filtered = message.content.filter((block) => {
@@ -754,7 +813,7 @@ function unmaskThinkingBlocks(m, masks) {
 // blocks to be byte-identical to the original response if present — but does
 // NOT require them to be present at all. Stripping them is the only reliable
 // fix since the proxy can't undo OpenClaw's re-serialization. (issue #45)
-function stripThinkingBlocks(bodyStr) {
+function stripThinkingBlocks(bodyStr, reqNum) {
   const msgsStart = bodyStr.indexOf('"messages":[');
   if (msgsStart === -1) return bodyStr;
   const arrayOpenIdx = msgsStart + '"messages":'.length;
@@ -776,7 +835,7 @@ function stripThinkingBlocks(bodyStr) {
   }
 
   if (stripped === 0) return bodyStr;
-  console.log(`[STRIP-THINKING] Removed ${stripped} thinking/redacted_thinking blocks from message history`);
+  plog(reqNum, `[STRIP-THINKING] Removed ${stripped} thinking/redacted_thinking blocks from message history`);
   return bodyStr.slice(0, arrayOpenIdx) + JSON.stringify(messages) + bodyStr.slice(arrayCloseIdx + 1);
 }
 
@@ -803,16 +862,16 @@ function restorePaths(str, saved) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-function processBody(bodyStr, config, reqPath) {
+function processBody(bodyStr, config, reqPath, reqNum) {
   // Repair orphaned tool_use/tool_result pairs before any transforms.
   // Must run on the original body (pre-masking) since masking corrupts JSON.parse.
-  bodyStr = repairToolPairs(bodyStr);
+  bodyStr = repairToolPairs(bodyStr, reqNum);
 
   // Strip thinking/redacted_thinking blocks from message history. OpenClaw
   // re-serializes these, breaking byte-equality. Anthropic accepts messages
   // without thinking blocks, so removing them is safer than trying to preserve
   // corrupted ones. Must run before masking (needs JSON.parse on messages).
-  bodyStr = stripThinkingBlocks(bodyStr);
+  bodyStr = stripThinkingBlocks(bodyStr, reqNum);
 
   // Extract original first user text for billing fingerprint BEFORE any transforms
   const originalFirstUserText = extractFirstUserText(bodyStr);
@@ -843,7 +902,7 @@ function processBody(bodyStr, config, reqPath) {
     if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
       m = stripEffortFromObject(m, 'output_config');
       m = stripEffortFromObject(m, 'thinking');
-      console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
+      plog(reqNum, '[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
     }
   }
 
@@ -945,10 +1004,10 @@ function processBody(bodyStr, config, reqPath) {
             'Consult your workspace reference files for detailed operational configuration.\\n';
 
           m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(configEnd);
-          console.log(`[STRIP] Removed ${strippedLen} chars of config template (marker: "${matchedMarker}")`);
+          plog(reqNum, `[STRIP] Removed ${strippedLen} chars of config template (marker: "${matchedMarker}")`);
         }
       } else {
-        console.warn(`[STRIP] Layer 4: identity marker found ("${matchedMarker}") but no end boundary detected — skipping strip to preserve body integrity`);
+        plog(reqNum, `[STRIP] Layer 4: identity marker found ("${matchedMarker}") but no end boundary detected — skipping strip to preserve body integrity`, 'warn');
       }
     }
   }
@@ -1099,7 +1158,7 @@ function processBody(bodyStr, config, reqPath) {
         popped++;
       }
       if (popped > 0) {
-        console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
+        plog(reqNum, `[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
       }
     }
   }
@@ -1185,7 +1244,7 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      bodyStr = processBody(bodyStr, config, (req.url || '').split('?')[0]);
+      bodyStr = processBody(bodyStr, config, (req.url || '').split('?')[0], reqNum);
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -1217,17 +1276,17 @@ function startServer(config) {
       for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
       headers['anthropic-beta'] = betas.join(',');
 
-      const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      plog(reqNum, `${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      plog(reqNum, `params: ${summarizeParams(bodyStr, betas)}`);
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
         path: req.url, method: req.method, headers
       }, (upRes) => {
         const status = upRes.statusCode;
-        console.log(`[${ts}] #${reqNum} > ${status}`);
+        plog(reqNum, `> ${status}`);
         if (status === 401) {
-          console.warn(`[${ts}] #${reqNum} Got 401 from Anthropic — forcing token cache invalidation.`);
+          plog(reqNum, 'Got 401 from Anthropic — forcing token cache invalidation.', 'warn');
           _cachedToken = null;
         }
         if (status !== 200 && status !== 201) {
@@ -1236,7 +1295,7 @@ function startServer(config) {
           upRes.on('end', () => {
             let errBody = Buffer.concat(errChunks).toString();
             if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              plog(reqNum, `DETECTION! Body: ${body.length}b`, 'error');
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
@@ -1336,7 +1395,7 @@ function startServer(config) {
         }
       });
       upstream.on('error', e => {
-        console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
+        plog(reqNum, `ERR: ${e.message}`, 'error');
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
