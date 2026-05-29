@@ -28,6 +28,86 @@ Haiku effort stripping) are reflected accurately.
 
 ---
 
+## v2.4.1 -- 2026-05-21
+
+### Strip thinking blocks from message history; /health reads token from disk
+
+**Changes:**
+- New `stripThinkingBlocks()` removes all `thinking` / `redacted_thinking` blocks
+  from assistant messages in the conversation history before forwarding (closes #45).
+- `/health` now reads the token from the credentials file instead of the in-memory
+  `_cachedToken`, so its `tokenExpiresInHours` / status reflect the on-disk token.
+
+**Why:**
+OpenClaw re-serializes conversation history, which changes the byte representation of
+`thinking` / `redacted_thinking` blocks. Anthropic requires these to be byte-identical
+if present, but does not require them at all — so stripping them is the only reliable
+fix, eliminating "Invalid signature in thinking block" and "thinking blocks cannot be
+modified" errors on multi-turn conversations.
+
+The `/health` fix addresses a false `token_expired` report: when the refresh timer
+updated credentials on disk but no API requests had come in, the in-memory
+`_cachedToken` stayed stale and health checks read the old value.
+
+---
+
+## v2.4.0 -- 2026-05-19
+
+### Port PR #48 improvements — OAuth refresh, Haiku effort strip, multi-marker identity, tests
+
+**Changes:**
+- OAuth token refresh: async `getTokenAsync` with race-condition dedup, disk
+  persistence of the refreshed token, and cache invalidation on a 401 from upstream.
+- Layer 2.5: `stripEffortFromObject` removes `effort` params for Haiku models, which
+  reject them with a 400.
+- Layer 4: multi-marker identity detection (6 `IDENTITY_MARKERS` variants) with
+  improved end-boundary patterns (UNC paths, generic Windows drive letters).
+- `injectCCStubs` now defaults to `false` (issue #43 — injected stubs caused
+  tool-not-found loops).
+- Stainless SDK version bumped 0.81.0 → 0.90.0.
+- Request handler is now async to support awaiting the OAuth refresh.
+- Added `test-functions.js` with 51 unit tests covering the pure functions.
+
+**Why:**
+Ports the accumulated fixes from PR #48. The OAuth refresh keeps long-running proxy
+instances authenticated without manual re-login; the Haiku effort strip and the
+broader identity-marker set reduce per-model 400s and missed config strips across the
+varied OpenClaw identity prompts.
+
+---
+
+## v2.3.0 -- 2026-05-19
+
+### Fix message tool param corruption and thinking block signatures; port kongkong7777 fork improvements
+
+**Changes:**
+- Layer 3: context-aware rename for the `message` tool — only replaces
+  `"name":"message"`, not the `message` parameter inside `input_schema`. Prevents SSE
+  `input_json_delta` chunking from splitting the renamed param across events.
+- Rewrote `maskThinkingBlocks` to handle varied JSON formatting (spaces after colons,
+  `type` not first key) so clients that re-serialize thinking blocks differently from
+  Anthropic's compact format no longer trigger signature errors.
+- Layer 3: removed `web_search` / `web_fetch` from tool renames — these are Anthropic
+  built-in tool types and renaming corrupts the `type` field.
+- Billing: `computeCch()` now emits a real SHA256 hash instead of hardcoded
+  `cch=00000`, and `buildBillingBlock` uses pre-transform text for a stable CCH.
+- `repairToolPairs()` removes orphaned `tool_use` / `tool_result` blocks.
+- `filterStubsAgainstExisting()` prevents duplicate tool names.
+- Metadata injection restricted to `/v1/messages` (stripped on `count_tokens`).
+- Removed density-classifier beta signals (`advanced-tool-use`, `fast-mode`) and added
+  `getModelBetas()` per-model beta filtering (Haiku, non-4.6).
+- Added string-aware `findMatchingBrace()` helper.
+
+**Why:**
+The `message` tool rename was corrupting the tool's own parameter, producing OpenClaw
+"[tools] message failed: message required" errors; scoping the rename to the `name`
+position fixes it. The thinking-block mask rewrite resolves "Invalid signature in
+thinking block" errors caused by clients re-serializing blocks in a non-compact format.
+The remaining items are improvements ported from the kongkong7777/openclaw-billing-proxy
+fork (billing hash, tool-pair repair, stub dedup, per-model betas).
+
+---
+
 ## v2.2.5 -- 2026-04-10
 
 ### Protect filesystem paths from Layer 2 global string replacement
