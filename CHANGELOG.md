@@ -1,5 +1,53 @@
 # Changelog
 
+## v2.6.0 -- 2026-05-31
+
+### Configurable Layer 2 scope: optionally stop translating agent-visible content
+
+**Changes:**
+- New `config.layer2Scope` flag controlling where Layer 2 (the `DEFAULT_REPLACEMENTS`
+  content-keyword sanitization) applies:
+  - `"all"` — replace across the entire request body. **Default; identical to prior
+    behavior.** Existing configs and the no-config path are unaffected.
+  - `"system"` — replace only inside the `"system":[...]` (or string-form `"system":"..."`)
+    prompt. User / assistant / tool_result content passes through untranslated, so the
+    upstream agent reads the **original** conversation history and file contents.
+  - `"off"` — skip Layer 2 content replacement entirely.
+- Unknown/invalid values fall back to `"all"` with a startup warning.
+- Filesystem-path protection (`protectPaths`/`restorePaths`) is preserved within whatever
+  scope is active — `.openclaw/...` paths are never corrupted.
+- The active scope is surfaced in the startup banner and in `/health` (`layers.layer2Scope`)
+  so it can be confirmed when flipped on live traffic.
+- Layers 3 (tool-name fingerprint) and 4 (system template strip) are **unchanged** — they
+  carry the anti-detection signal and are deliberately left intact. The reverse map
+  (Layer 7) is also unchanged.
+- Added 5 unit tests covering all three scopes, the unknown-value fallback, and path
+  preservation under `"system"` scope.
+
+**Why:**
+Under `"all"`, every string the agent sees — chat history, tool results, file contents —
+is the sanitized/"translated" version, so the agent can never obtain the real text.
+Out-of-band testing (hex-escaped triggers sent direct to `api.anthropic.com` with a
+realistic Claude Code header) showed three request variants — no trigger, raw trigger in
+`system`, raw trigger in a user message — all returning HTTP 200 with
+`anthropic-ratelimit-unified-status: allowed` and no overage/429. Conclusion: Anthropic's
+third-party detection does not key off request-body content keywords; the load is carried
+by the tool-name fingerprint (Layer 3) and system-template structure (Layer 4). Layer 2's
+keyword replacement over user/assistant/tool_result content therefore contributes no
+observable detection resistance and is over-defense.
+
+**Unverified risk (do not treat the narrowed scopes as proven safe):**
+- The supporting test covered only Haiku + single-shot + short context.
+- The tool-**array** fingerprint path was not exercised (the probe carried no real agent
+  tool set) — this is the genuine risk point once Layer 2 stops rewriting content. Layers
+  3/4 are kept intact precisely to cover it.
+- Acceptance is empirical: flip `layer2Scope` to `"system"`/`"off"` during real agent
+  traffic and observe. The subscription has Extra Usage disabled, so a third-party verdict
+  returns rejected/errors immediately rather than billing silently — the failure is loud
+  and instant.
+
+---
+
 ## v2.5.0 -- 2026-05-29
 
 ### Structured request logging: local-time ISO timestamps, per-request correlation, param summary
