@@ -22,7 +22,7 @@ new Function(...Object.keys(sandbox),
     computeCch, computeBillingFingerprint, extractFirstUserText,
     getModelBetas, findMatchingBrace, findMatchingBracket, stripEffortFromObject,
     repairToolPairs, stripThinkingBlocks, maskThinkingBlocks, unmaskThinkingBlocks, reverseMap,
-    filterStubsAgainstExisting, protectPaths, restorePaths,
+    filterStubsAgainstExisting, protectPaths, restorePaths, processBody,
     CONTEXT_AWARE_RENAMES, DEFAULT_TOOL_RENAMES, DEFAULT_REVERSE_MAP, DEFAULT_PROP_RENAMES,
     CC_TOOL_STUBS, REQUIRED_BETAS,
   };
@@ -395,6 +395,61 @@ test('findMatchingBracket: simple array', () => {
 });
 test('findMatchingBracket: nested', () => {
   assert.strictEqual(T.findMatchingBracket('[[1],[2]]', 0), 8);
+});
+
+// Z. Layer 2 scope (config.layer2Scope: all | system | off)
+console.log('\n--- Layer 2 scope ---');
+// Isolate Layer 2: disable Layers 4/5 and stubs so only content replacement varies.
+const L2_BASE_CONFIG = {
+  replacements: [['openclaw', 'ocplatform']],
+  toolRenames: [],
+  contextAwareRenames: new Set(),
+  propRenames: [],
+  stripSystemConfig: false,
+  stripToolDescriptions: false,
+  injectCCStubs: false,
+  stripTrailingAssistantPrefill: false,
+};
+const L2_BODY = JSON.stringify({
+  model: 'claude-opus-4-8',
+  system: [{ type: 'text', text: 'You are openclaw assistant' }],
+  messages: [{ role: 'user', content: 'hello openclaw world' }],
+});
+
+test('scope "all" replaces in BOTH system and user content', () => {
+  const out = T.processBody(L2_BODY, { ...L2_BASE_CONFIG, layer2Scope: 'all' }, '/v1/messages', 0);
+  assert.ok(out.includes('You are ocplatform assistant'), 'system should be replaced');
+  assert.ok(out.includes('hello ocplatform world'), 'user content should be replaced');
+  assert.ok(!out.includes('openclaw'), 'no original keyword should remain');
+});
+
+test('scope "system" replaces system ONLY, leaves user content original', () => {
+  const out = T.processBody(L2_BODY, { ...L2_BASE_CONFIG, layer2Scope: 'system' }, '/v1/messages', 0);
+  assert.ok(out.includes('You are ocplatform assistant'), 'system should be replaced');
+  assert.ok(out.includes('hello openclaw world'), 'user content must stay original');
+});
+
+test('scope "off" leaves both system and user content original', () => {
+  const out = T.processBody(L2_BODY, { ...L2_BASE_CONFIG, layer2Scope: 'off' }, '/v1/messages', 0);
+  assert.ok(out.includes('You are openclaw assistant'), 'system must stay original');
+  assert.ok(out.includes('hello openclaw world'), 'user content must stay original');
+  assert.ok(!out.includes('ocplatform'), 'nothing should be replaced');
+});
+
+test('unknown scope value falls back to "all" behavior', () => {
+  const out = T.processBody(L2_BODY, { ...L2_BASE_CONFIG, layer2Scope: 'bogus' }, '/v1/messages', 0);
+  assert.ok(out.includes('hello ocplatform world'), 'unknown scope should behave as "all"');
+});
+
+test('scope "system" still protects filesystem paths in system prompt', () => {
+  const body = JSON.stringify({
+    model: 'claude-opus-4-8',
+    system: [{ type: 'text', text: 'workspace at /home/u/.openclaw/x and keyword openclaw' }],
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  const out = T.processBody(body, { ...L2_BASE_CONFIG, layer2Scope: 'system' }, '/v1/messages', 0);
+  assert.ok(out.includes('/home/u/.openclaw/x'), 'path must be preserved');
+  assert.ok(out.includes('keyword ocplatform'), 'bare keyword must be replaced');
 });
 
 // --- summary ---

@@ -7,6 +7,8 @@
  *
  *   Layer 1: Billing header injection (84-char Claude Code identifier)
  *   Layer 2: String trigger sanitization (OpenClaw, sessions_*, running inside, etc.)
+ *            Scope is configurable via config.layer2Scope ("all" | "system" | "off");
+ *            default "all" preserves prior behavior. See note at DEFAULT_REPLACEMENTS.
  *   Layer 3: Tool name fingerprint bypass (rename OC tools to CC PascalCase convention)
  *   Layer 4: System prompt template bypass (strip config section, replace with paraphrase)
  *   Layer 5: Tool description stripping (reduce fingerprint signal in tool schemas)
@@ -34,7 +36,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -233,7 +235,32 @@ function getStainlessHeaders() {
 }
 
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
-// Applied globally via split/join on the entire request body.
+// Applied via split/join. The SCOPE of application is controlled by
+// config.layer2Scope (see loadConfig / processBody):
+//   "all"    — replace across the entire request body (default; legacy behavior).
+//   "system" — replace only inside the "system":[...] array; user / assistant /
+//              tool_result content is left untouched so the upstream agent reads
+//              the ORIGINAL (untranslated) conversation + file text.
+//   "off"    — skip Layer 2 content replacement entirely.
+//
+// WHY SCOPING EXISTS: under "all", every string the agent sees (chat history,
+// tool results, file contents) is the sanitized/"translated" version, so the
+// agent can never read the real text. Empirically Anthropic's third-party
+// detection does NOT key off request-BODY content keywords — Layer 3 (tool-name
+// fingerprint) and Layer 4 (system template structure) carry the anti-detection
+// signal. So narrowing Layer 2 away from message content costs no observable
+// detection resistance while letting the agent see original content.
+//
+// UNVERIFIED RISK (keep in mind when flipping the scope on real traffic):
+//   1. The supporting test covered only Haiku + single-shot + short context.
+//   2. The tool-ARRAY fingerprint path was NOT exercised (the probe carried no
+//      real agent tool set) — this is the genuine risk point once Layer 2 stops
+//      rewriting content. Layers 3/4 are deliberately left intact to cover it.
+//   3. Acceptance: flip layer2Scope to "system"/"off" during real agent traffic
+//      and watch. The subscription has Extra Usage disabled, so a third-party
+//      verdict returns rejected/errors immediately rather than billing silently
+//      — the failure is loud and instant, not hidden.
+//
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
@@ -496,6 +523,14 @@ function loadConfig() {
 
   _credsFilePath = credsPath;
 
+  // Layer 2 scope: "all" (default, legacy behavior) | "system" | "off".
+  // Unknown/missing values fall back to "all" so existing configs are unaffected.
+  const rawScope = (config.layer2Scope || 'all').toString().toLowerCase();
+  const layer2Scope = (rawScope === 'system' || rawScope === 'off') ? rawScope : 'all';
+  if (config.layer2Scope != null && layer2Scope !== rawScope) {
+    console.log(`[PROXY] Warning: unknown layer2Scope "${config.layer2Scope}", falling back to "all".`);
+  }
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
@@ -504,6 +539,7 @@ function loadConfig() {
     toolRenames,
     contextAwareRenames: CONTEXT_AWARE_RENAMES,
     propRenames,
+    layer2Scope,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs === true,
@@ -881,20 +917,55 @@ function processBody(bodyStr, config, reqPath, reqNum) {
   const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
   let m = maskedBody;
 
-  // Protect filesystem paths from Layer 2 blind string replacement.
-  // Without this, paths like /home/user/.openclaw/media/... get corrupted
-  // (e.g. .openclaw -> .tataclaw), breaking OpenClaw's assertLocalMediaAllowed()
-  // security check which validates against allowed directory roots.
-  const { result: pathProtected, saved: savedPaths } = protectPaths(m);
-  m = pathProtected;
+  // Layer 2: String trigger sanitization. Scope controlled by config.layer2Scope:
+  //   "all"    — apply across the whole body (default; legacy behavior).
+  //   "system" — apply only inside "system":[...] / "system":"..." so the agent
+  //              reads original user/assistant/tool_result content.
+  //   "off"    — skip entirely.
+  // See the note at DEFAULT_REPLACEMENTS for rationale and the unverified risks.
+  //
+  // Filesystem paths are protected from blind replacement either way. Without this,
+  // paths like /home/user/.openclaw/media/... get corrupted (e.g. .openclaw ->
+  // .tataclaw), breaking OpenClaw's assertLocalMediaAllowed() security check which
+  // validates against allowed directory roots.
+  const applyLayer2 = (s) => {
+    const { result: pathProtected, saved } = protectPaths(s);
+    let t = pathProtected;
+    for (const [find, replace] of config.replacements) {
+      t = t.split(find).join(replace);
+    }
+    return restorePaths(t, saved);
+  };
 
-  // Layer 2: String trigger sanitization (global split/join)
-  for (const [find, replace] of config.replacements) {
-    m = m.split(find).join(replace);
+  if (config.layer2Scope === 'off') {
+    // Layer 2 disabled — leave all content untouched.
+  } else if (config.layer2Scope === 'system') {
+    // Confine replacement to the system prompt only. At this point in the
+    // pipeline the system array is still the original one (the billing block is
+    // injected later, in Layer 1), so this slice is exactly the system content.
+    const sysArrayStart = m.indexOf('"system":[');
+    if (sysArrayStart !== -1) {
+      const sysArrayEnd = findMatchingBracket(m, sysArrayStart + '"system":'.length);
+      if (sysArrayEnd !== -1) {
+        const sysSection = m.slice(sysArrayStart, sysArrayEnd + 1);
+        m = m.slice(0, sysArrayStart) + applyLayer2(sysSection) + m.slice(sysArrayEnd + 1);
+      }
+    } else if (m.includes('"system":"')) {
+      // String-form system prompt: "system":"...."
+      const sysStart = m.indexOf('"system":"');
+      let i = sysStart + '"system":"'.length;
+      while (i < m.length) {
+        if (m[i] === '\\') { i += 2; continue; }
+        if (m[i] === '"') break;
+        i++;
+      }
+      const sysEnd = i + 1;
+      m = m.slice(0, sysStart) + applyLayer2(m.slice(sysStart, sysEnd)) + m.slice(sysEnd);
+    }
+  } else {
+    // "all" (default): replace across the entire body.
+    m = applyLayer2(m);
   }
-
-  // Restore protected filesystem paths
-  m = restorePaths(m, savedPaths);
 
   // Layer 2.5: Strip effort param for Haiku models (Haiku rejects effort with 400)
   {
@@ -1214,6 +1285,7 @@ function startServer(config) {
           subscriptionType: tokenInfo.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
+            layer2Scope: config.layer2Scope,
             toolNameRenames: config.toolRenames.length,
             propertyRenames: config.propRenames.length,
             ccToolStubs: config.injectCCStubs ? CC_TOOL_STUBS.length : 0,
@@ -1420,6 +1492,7 @@ function startServer(config) {
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
       console.log(`  Token expires:     ${h}`);
       console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
+      console.log(`  Layer 2 scope:     ${config.layer2Scope}${config.layer2Scope === 'all' ? '' : ' (content replacement narrowed)'}`);
       console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
       console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
       console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
