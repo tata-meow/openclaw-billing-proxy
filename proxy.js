@@ -36,7 +36,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -523,6 +523,24 @@ function loadConfig() {
 
   _credsFilePath = credsPath;
 
+  // Bind address(es): which network interfaces to listen on.
+  // Precedence: PROXY_HOST env > config.bind > '127.0.0.1' (loopback only).
+  // config.bind accepts a string ("0.0.0.0") or an array (["127.0.0.1", "::1"]).
+  // "::" binds all IPv6 + IPv4 (dual-stack); "0.0.0.0" binds all IPv4.
+  // SECURITY: binding beyond 127.0.0.1 exposes the proxy on the network — only
+  // do this on a trusted LAN or behind a firewall, since anyone who can reach
+  // the port can spend your Claude subscription quota.
+  let bind;
+  if (process.env.PROXY_HOST) {
+    bind = [process.env.PROXY_HOST];
+  } else if (config.bind != null) {
+    bind = Array.isArray(config.bind) ? config.bind : [config.bind];
+  } else {
+    bind = ['127.0.0.1'];
+  }
+  bind = bind.map(h => String(h).trim()).filter(Boolean);
+  if (bind.length === 0) bind = ['127.0.0.1'];
+
   // Layer 2 scope: "all" (default, legacy behavior) | "system" | "off".
   // Unknown/missing values fall back to "all" so existing configs are unaffected.
   const rawScope = (config.layer2Scope || 'all').toString().toLowerCase();
@@ -533,6 +551,7 @@ function loadConfig() {
 
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
+    bind,
     credsPath,
     replacements,
     reverseMap,
@@ -1268,7 +1287,7 @@ function startServer(config) {
   let requestCount = 0;
   const startedAt = Date.now();
 
-  const server = http.createServer((req, res) => {
+  const handler = (req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const tokenInfo = getToken(config.credsPath);
@@ -1476,35 +1495,54 @@ function startServer(config) {
       upstream.write(body);
       upstream.end();
     });
-  });
+  };
 
-  const bindHost = process.env.PROXY_HOST || '127.0.0.1';
-  server.listen(config.port, bindHost, () => {
-    try {
-      const oauth = getToken(config.credsPath);
-      const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
-      const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
-      console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
-      console.log(`  ─────────────────────────────`);
-      console.log(`  Port:              ${config.port}`);
-      console.log(`  Bind address:      ${bindHost}`);
-      console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
-      console.log(`  Subscription:      ${oauth.subscriptionType}`);
-      console.log(`  Token expires:     ${h}`);
-      console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
-      console.log(`  Layer 2 scope:     ${config.layer2Scope}${config.layer2Scope === 'all' ? '' : ' (content replacement narrowed)'}`);
-      console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
-      console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
-      console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
-      console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
-      console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
-      console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
-      console.log(`  CC headers:        Stainless SDK + identity`);
-      console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
-    } catch (e) {
-      console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
-    }
+  // Wrap an IPv6 literal in brackets for display/URL purposes; leave hostnames
+  // and IPv4 untouched. Wildcard binds map to a loopback address clients can
+  // actually dial.
+  const urlHost = (h) => {
+    if (h === '::' || h === '0.0.0.0') return '127.0.0.1';
+    return h.includes(':') ? `[${h}]` : h;
+  };
+
+  const bindHosts = config.bind;
+  let bannerShown = false;
+
+  bindHosts.forEach((bindHost) => {
+    const server = http.createServer(handler);
+    server.on('error', (e) => {
+      console.error(`  Failed to bind ${bindHost}:${config.port} — ${e.message}`);
+      process.exit(1);
+    });
+    server.listen(config.port, bindHost, () => {
+      if (bannerShown) return;
+      bannerShown = true;
+      try {
+        const oauth = getToken(config.credsPath);
+        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
+        console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
+        console.log(`  ─────────────────────────────`);
+        console.log(`  Port:              ${config.port}`);
+        console.log(`  Bind address:      ${bindHosts.join(', ')}`);
+        console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
+        console.log(`  Subscription:      ${oauth.subscriptionType}`);
+        console.log(`  Token expires:     ${h}`);
+        console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
+        console.log(`  Layer 2 scope:     ${config.layer2Scope}${config.layer2Scope === 'all' ? '' : ' (content replacement narrowed)'}`);
+        console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
+        console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
+        console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
+        console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
+        console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
+        console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+        console.log(`  CC headers:        Stainless SDK + identity`);
+        console.log(`  Credentials:       ${config.credsPath}`);
+        console.log(`\n  Ready. Set openclaw.json baseUrl to http://${urlHost(bindHosts[0])}:${config.port}\n`);
+      } catch (e) {
+        console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
+      }
+    });
   });
 
   process.on('SIGINT', () => process.exit(0));
