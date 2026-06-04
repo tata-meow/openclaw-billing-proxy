@@ -2,6 +2,9 @@
   "port": 18801,
   "credentialsPath": "~/.claude/.credentials.json",
 
+  "bind": ["127.0.0.1"],
+  "_comment_bind": "Network interface(s) to listen on. String or array. Default '127.0.0.1' (loopback only). Use '0.0.0.0' for all IPv4, '::' for all IPv6 + IPv4 (dual-stack), or list specific addresses e.g. ['127.0.0.1', '::1']. The PROXY_HOST env var overrides this. SECURITY: binding beyond loopback exposes the proxy on your network — anyone who can reach the port can spend your Claude subscription quota, so only do this on a trusted LAN or behind a firewall.",
+
   "stripSystemConfig": true,
   "stripToolDescriptions": true,
   "injectCCStubs": false,

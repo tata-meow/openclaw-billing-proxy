@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.7.0 -- 2026-06-04
+
+### Configurable bind address: listen beyond loopback
+
+**Changes:**
+- New `config.bind` option controlling which network interface(s) the proxy
+  listens on. Accepts a string or an array of addresses:
+  - `"127.0.0.1"` — loopback only. **Default; identical to prior behavior.**
+  - `"0.0.0.0"` — all IPv4 interfaces.
+  - `"::"` — all IPv6 + IPv4 interfaces (dual-stack).
+  - `["127.0.0.1", "::1"]` — listen on multiple specific addresses; one HTTP
+    server is created per address, all sharing the same request handler.
+- Precedence: `PROXY_HOST` env var > `config.bind` > `127.0.0.1`. The env var
+  still wins so Docker Compose's `PROXY_HOST=0.0.0.0` is unaffected.
+- Startup banner now lists all bind addresses; the "Ready" baseUrl hint maps
+  wildcard binds (`::` / `0.0.0.0`) to `127.0.0.1` and brackets IPv6 literals.
+- Bind failures (e.g. `EADDRINUSE`) now print a clear per-address error and exit
+  instead of throwing an unhandled exception.
+
+**Security:** binding beyond `127.0.0.1` exposes the proxy on the network —
+anyone who can reach the port can spend your Claude subscription quota. Only do
+this on a trusted LAN or behind a firewall.
+
 ## v2.6.0 -- 2026-05-31
 
 ### Configurable Layer 2 scope: optionally stop translating agent-visible content
