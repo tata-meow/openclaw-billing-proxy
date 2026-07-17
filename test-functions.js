@@ -119,8 +119,8 @@ test('haiku excludes interleaved-thinking', () => {
 test('sonnet-4-6 includes effort', () => {
   assert.ok(T.getModelBetas('claude-sonnet-4-6').includes('effort-2025-11-24'));
 });
-test('sonnet-4-5 excludes effort', () => {
-  assert.ok(!T.getModelBetas('claude-sonnet-4-5').includes('effort-2025-11-24'));
+test('sonnet-4-5 includes effort', () => {
+  assert.ok(T.getModelBetas('claude-sonnet-4-5').includes('effort-2025-11-24'));
 });
 test('opus-4-6 includes effort', () => {
   assert.ok(T.getModelBetas('claude-opus-4-6').includes('effort-2025-11-24'));
@@ -135,7 +135,6 @@ test('all include oauth and claude-code betas', () => {
 test('no fake betas', () => {
   for (const m of ['claude-haiku-4-5', 'claude-sonnet-4-6']) {
     const b = T.getModelBetas(m);
-    assert.ok(!b.includes('advanced-tool-use-2025-11-20'));
     assert.ok(!b.includes('fast-mode-2026-02-01'));
   }
 });

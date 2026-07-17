@@ -36,10 +36,10 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.7.0';
+const VERSION = '2.8.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.97';
+const CC_VERSION = '2.1.211';
 
 // Billing fingerprint constants (matches real CC utils/fingerprint.ts)
 const BILLING_HASH_SALT = '59cf53e54c78';
@@ -108,23 +108,24 @@ function summarizeParams(bodyStr, betas) {
   return parts.join(' ');
 }
 
-// Beta flags required for OAuth + Claude Code features
-// 'advanced-tool-use-2025-11-20' and 'fast-mode-2026-02-01' removed — they don't
-// exist in real CC traffic and are density-classifier signals.
+// Beta flags required for OAuth + Claude Code features.
+// Confirmed present in CC 2.1.211 binary via UC() constant extraction.
 const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24'
+  'effort-2025-11-24',
+  'advanced-tool-use-2025-11-20',
+  'thinking-token-count-2026-05-13'
 ];
 
 function getModelBetas(model) {
   const m = (model || '').toLowerCase();
   return REQUIRED_BETAS.filter(b => {
     if (b === 'interleaved-thinking-2025-05-14' && m.includes('haiku')) return false;
-    if (b === 'effort-2025-11-24' && !/-4-6\b/.test(m)) return false;
+    if (b === 'effort-2025-11-24' && m.includes('haiku')) return false;
     return true;
   });
 }
@@ -216,16 +217,16 @@ function buildBillingBlock(bodyStr, preExtractedText) {
 // Real Claude Code sends these on every request via the Anthropic JS SDK.
 function getStainlessHeaders() {
   const p = process.platform;
-  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  const osName = p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   return {
-    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'user-agent': `claude-code/${CC_VERSION}`,
     'x-app': 'cli',
     'x-claude-code-session-id': INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.90.0',
+    'x-stainless-package-version': '0.112.1',
     'x-stainless-runtime': 'node',
     'x-stainless-runtime-version': process.version,
     'x-stainless-retry-count': '0',

@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.8.0 -- 2026-07-17
+
+### Update Claude Code emulation to CC 2.1.211
+
+Audit performed via binary analysis of the CC 2.1.211 ELF binary and
+Anthropic SDK 0.112.1 source (`detect-platform.ts`, `client.ts`).
+The proxy was emulating CC 2.1.97 (published 2026-04-08), 114 releases behind.
+
+**Changed:**
+- **CC_VERSION**: 2.1.97 → 2.1.211 (affects billing fingerprint, user-agent,
+  startup banner)
+- **User-Agent**: `claude-cli/{v} (external, cli)` → `claude-code/{v}` (new
+  primary format confirmed in CC binary — legacy `claude-cli/` codepath still
+  exists but is no longer the default)
+- **x-stainless-package-version**: 0.90.0 → 0.112.1 (latest @anthropic-ai/sdk)
+- **X-Stainless-OS**: `macOS` → `MacOS` (matches SDK `detect-platform.ts`
+  casing: `if (platform === 'darwin') return 'MacOS'`)
+- **effort beta filter**: was only sent for models matching `/-4-6\b/`; now sent
+  for all models except Haiku (matches CC behavior for Opus 4.7/4.8, Sonnet 5,
+  Fable 5)
+
+**Added:**
+- Beta `advanced-tool-use-2025-11-20`: confirmed present in CC 2.1.211 binary
+  as `UC("tool_search","advanced-tool-use-2025-11-20")`. Was previously removed
+  as suspected density-classifier signal — re-added.
+- Beta `thinking-token-count-2026-05-13`: new beta for thinking token counting,
+  present in CC 2.1.211 as `UC("thinking_token_count",...)`.
+
+**Unchanged (verified still correct):**
+- Billing fingerprint salt `59cf53e54c78` and indices `[4,7,20]` — confirmed
+  identical in CC 2.1.211 binary
+- `anthropic-version: 2023-06-01` — confirmed unchanged in SDK 0.112.1
+- `oauth-2025-04-20` and `claude-code-20250219` betas — confirmed still present
+  in CC binary (yk constant and IEt constant respectively)
+
 ## v2.7.0 -- 2026-06-04
 
 ### Configurable bind address: listen beyond loopback
