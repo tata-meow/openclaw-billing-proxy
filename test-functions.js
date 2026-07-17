@@ -19,7 +19,7 @@ const sandbox = {
 new Function(...Object.keys(sandbox),
   wrappedSource + `\n
   this._test = {
-    computeCch, computeBillingFingerprint, extractFirstUserText,
+    computeBillingFingerprint, extractFirstUserText,
     getModelBetas, findMatchingBrace, findMatchingBracket, stripEffortFromObject,
     repairToolPairs, stripThinkingBlocks, maskThinkingBlocks, unmaskThinkingBlocks, reverseMap,
     filterStubsAgainstExisting, protectPaths, restorePaths, processBody,
@@ -48,24 +48,7 @@ function test(name, fn) {
 
 console.log('\n=== proxy.js Unit Tests (v2.4.0) ===\n');
 
-// A. computeCch
-console.log('--- computeCch ---');
-test('returns 5-char hex', () => {
-  const r = T.computeCch('hello');
-  assert.strictEqual(r.length, 5);
-  assert.match(r, /^[0-9a-f]{5}$/);
-});
-test('deterministic', () => {
-  assert.strictEqual(T.computeCch('test'), T.computeCch('test'));
-});
-test('different inputs differ', () => {
-  assert.notStrictEqual(T.computeCch('abc'), T.computeCch('xyz'));
-});
-test('empty string works', () => {
-  assert.match(T.computeCch(''), /^[0-9a-f]{5}$/);
-});
-
-// B. computeBillingFingerprint
+// A. computeBillingFingerprint
 console.log('\n--- computeBillingFingerprint ---');
 test('returns 3-char hex', () => {
   const r = T.computeBillingFingerprint('some text here for testing');

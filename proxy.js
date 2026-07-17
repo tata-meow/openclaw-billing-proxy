@@ -36,10 +36,14 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.8.0';
+const VERSION = '2.9.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.211';
+
+// Last upstream request-id for cc_prev_req billing-header chaining.
+// Genuine CC chains consecutive requests; a static header is a detection tell.
+let LAST_REQUEST_ID = null;
 
 // Billing fingerprint constants (matches real CC utils/fingerprint.ts)
 const BILLING_HASH_SALT = '59cf53e54c78';
@@ -48,6 +52,43 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
+// Account UUID from OAuth profile — genuine CC includes it in metadata.user_id.
+// Set via CLAUDE_CODE_ACCOUNT_UUID / CC_ACCOUNT_UUID env, `account_uuid` in
+// config.json, or auto-fetched from /api/oauth/profile at startup.
+let ACCOUNT_UUID = process.env.CLAUDE_CODE_ACCOUNT_UUID || process.env.CC_ACCOUNT_UUID || '';
+try {
+  if (!ACCOUNT_UUID) {
+    ACCOUNT_UUID = (JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'config.json'), 'utf8')).account_uuid) || '';
+  }
+} catch (e) {}
+
+async function fetchAccountUUID(accessToken) {
+  if (ACCOUNT_UUID) return;
+  const https = require('https');
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'claude.ai', port: 443,
+      path: '/api/oauth/profile', method: 'GET',
+      headers: { 'authorization': `Bearer ${accessToken}`, 'accept': 'application/json' }
+    }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const profile = JSON.parse(Buffer.concat(chunks).toString());
+          if (profile.account_uuid) {
+            ACCOUNT_UUID = profile.account_uuid;
+            plog(null, `Auto-fetched account_uuid: ${ACCOUNT_UUID.slice(0, 8)}...`);
+          }
+        } catch (e) {}
+        resolve();
+      });
+    });
+    req.on('error', () => resolve());
+    req.setTimeout(10000, () => { req.destroy(); resolve(); });
+    req.end();
+  });
+}
 
 // ─── Logging helpers ──────────────────────────────────────────────────────────
 // Local-time ISO 8601 timestamp with millisecond precision and timezone offset,
@@ -108,17 +149,17 @@ function summarizeParams(bodyStr, betas) {
   return parts.join(' ');
 }
 
-// Beta flags required for OAuth + Claude Code features.
-// Confirmed present in CC 2.1.211 binary via UC() constant extraction.
+// Beta flags — order matters (merged/reordered set is a fingerprint).
+// Captured from genuine CC 2.1.211 via capture proxy; override wholesale.
 const REQUIRED_BETAS = [
-  'oauth-2025-04-20',
   'claude-code-20250219',
+  'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
+  'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24',
   'advanced-tool-use-2025-11-20',
-  'thinking-token-count-2026-05-13'
+  'effort-2025-11-24'
 ];
 
 function getModelBetas(model) {
@@ -201,16 +242,12 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
-function computeCch(text) {
-  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 5);
-}
-
 function buildBillingBlock(bodyStr, preExtractedText) {
   const firstText = preExtractedText !== undefined ? preExtractedText : extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
-  const cch = computeCch(firstText);
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=${cch};"}`;
+  const prev = LAST_REQUEST_ID ? ` cc_prev_req=${LAST_REQUEST_ID};` : '';
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=sdk-cli;${prev}"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
@@ -220,7 +257,7 @@ function getStainlessHeaders() {
   const osName = p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   return {
-    'user-agent': `claude-code/${CC_VERSION}`,
+    'user-agent': `claude-cli/${CC_VERSION} (external, sdk-cli)`,
     'x-app': 'cli',
     'x-claude-code-session-id': INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
@@ -228,7 +265,7 @@ function getStainlessHeaders() {
     'x-stainless-os': osName,
     'x-stainless-package-version': '0.112.1',
     'x-stainless-runtime': 'node',
-    'x-stainless-runtime-version': process.version,
+    'x-stainless-runtime-version': 'v26.3.0',
     'x-stainless-retry-count': '0',
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
@@ -1179,7 +1216,7 @@ function processBody(bodyStr, config, reqPath, reqNum) {
   // Restricted to /v1/messages — count_tokens and other sub-endpoints reject
   // the metadata field ("Extra inputs are not permitted").
   if (reqPath === '/v1/messages' || reqPath === '/v1/messages/') {
-    const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+    const metaValue = JSON.stringify({ device_id: DEVICE_ID, account_uuid: ACCOUNT_UUID, session_id: INSTANCE_SESSION_ID });
     const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
     const existingMeta = m.indexOf('"metadata":{');
     if (existingMeta !== -1) {
@@ -1360,23 +1397,30 @@ function startServer(config) {
 
       // Per-model beta filtering: skip interleaved-thinking for Haiku,
       // skip effort for non-4.6 models.
+      // Override wholesale — a merged/reordered set is itself a fingerprint.
       const modelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
       const modelName = modelMatch ? modelMatch[1] : '';
-      const modelBetas = getModelBetas(modelName);
-      const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
+      const betas = getModelBetas(modelName);
       headers['anthropic-beta'] = betas.join(',');
+
+      // Genuine CC posts to /v1/messages?beta=true
+      let upstreamPath = req.url;
+      if (upstreamPath.startsWith('/v1/messages') && !/[?&]beta=true/.test(upstreamPath)) {
+        upstreamPath += (upstreamPath.includes('?') ? '&' : '?') + 'beta=true';
+      }
 
       plog(reqNum, `${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
       plog(reqNum, `params: ${summarizeParams(bodyStr, betas)}`);
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
+        path: upstreamPath, method: req.method, headers
       }, (upRes) => {
         const status = upRes.statusCode;
         plog(reqNum, `> ${status}`);
+        // Track upstream request-id for cc_prev_req chaining
+        const rid = upRes.headers['request-id'] || upRes.headers['anthropic-request-id'];
+        if (rid) LAST_REQUEST_ID = rid;
         if (status === 401) {
           plog(reqNum, 'Got 401 from Anthropic — forcing token cache invalidation.', 'warn');
           _cachedToken = null;
@@ -1515,11 +1559,12 @@ function startServer(config) {
       console.error(`  Failed to bind ${bindHost}:${config.port} — ${e.message}`);
       process.exit(1);
     });
-    server.listen(config.port, bindHost, () => {
+    server.listen(config.port, bindHost, async () => {
       if (bannerShown) return;
       bannerShown = true;
       try {
         const oauth = getToken(config.credsPath);
+        await fetchAccountUUID(oauth.accessToken);
         const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
         const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
         console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
@@ -1537,6 +1582,7 @@ function startServer(config) {
         console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
         console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
         console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+        console.log(`  Account UUID:      ${ACCOUNT_UUID ? ACCOUNT_UUID.slice(0, 8) + '...' : '(not set — see CC_ACCOUNT_UUID)'}`);
         console.log(`  CC headers:        Stainless SDK + identity`);
         console.log(`  Credentials:       ${config.credsPath}`);
         console.log(`\n  Ready. Set openclaw.json baseUrl to http://${urlHost(bindHosts[0])}:${config.port}\n`);
