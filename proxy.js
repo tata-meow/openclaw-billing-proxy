@@ -36,10 +36,10 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.9.0';
+const VERSION = '2.10.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.211';
+const CC_VERSION = '2.1.292';
 
 // Last upstream request-id for cc_prev_req billing-header chaining.
 // Genuine CC chains consecutive requests; a static header is a detection tell.
@@ -150,25 +150,34 @@ function summarizeParams(bodyStr, betas) {
 }
 
 // Beta flags — order matters (merged/reordered set is a fingerprint).
-// Captured from genuine CC 2.1.211 via capture proxy; override wholesale.
+// Derived from CC 2.1.292 binary: only betas that pass the IN/NN rules for
+// firstParty + OAuth + sdk-cli on the messages API. Internal-only betas
+// (ccr-byoc, mcp-servers, cache-keepalive, etc.) are excluded — the API
+// rejects them with 400.
 const REQUIRED_BETAS = [
   'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
+  'redact-thinking-2026-02-12',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'advanced-tool-use-2025-11-20',
-  'effort-2025-11-24'
+  'mid-conversation-system-2026-04-07',
+  'per-turn-control-2026-07-01',
 ];
 
 function getModelBetas(model) {
   const m = (model || '').toLowerCase();
-  return REQUIRED_BETAS.filter(b => {
+  const betas = REQUIRED_BETAS.filter(b => {
+    if (b === 'claude-code-20250219' && m.includes('haiku')) return false;
     if (b === 'interleaved-thinking-2025-05-14' && m.includes('haiku')) return false;
-    if (b === 'effort-2025-11-24' && m.includes('haiku')) return false;
+    if (b === 'redact-thinking-2026-02-12' && m.includes('haiku')) return false;
+    if (b === 'thinking-token-count-2026-05-13' && m.includes('haiku')) return false;
     return true;
   });
+  // ponytail: context-1m only for [1m] models, matching CC's Eu() guard
+  if (/\[1m\]/i.test(model)) betas.push('context-1m-2025-08-07');
+  return betas;
 }
 
 // OAuth token cache (for refresh support)
@@ -242,12 +251,17 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
+// ponytail: prompt_index/turn_index are monotonic counters; static 0/1 is fine
+// since each proxy request is effectively one prompt with one turn.
+let PROMPT_COUNTER = 0;
+
 function buildBillingBlock(bodyStr, preExtractedText) {
   const firstText = preExtractedText !== undefined ? preExtractedText : extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
   const prev = LAST_REQUEST_ID ? ` cc_prev_req=${LAST_REQUEST_ID};` : '';
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=sdk-cli;${prev}"}`;
+  const promptIdx = PROMPT_COUNTER++;
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=sdk-cli;${prev} cc_prompt_index=${promptIdx}; cc_turn_index=1;"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
@@ -257,15 +271,15 @@ function getStainlessHeaders() {
   const osName = p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   return {
-    'user-agent': `claude-cli/${CC_VERSION} (external, sdk-cli)`,
+    'user-agent': `Anthropic/JS 0.128.0`,
     'x-app': 'cli',
     'x-claude-code-session-id': INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.112.1',
+    'x-stainless-package-version': '0.128.0',
     'x-stainless-runtime': 'node',
-    'x-stainless-runtime-version': 'v26.3.0',
+    'x-stainless-runtime-version': 'v1.4.3',
     'x-stainless-retry-count': '0',
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
@@ -1394,6 +1408,7 @@ function startServer(config) {
       for (const [k, v] of Object.entries(ccHeaders)) {
         headers[k] = v;
       }
+      headers['anthropic-client-platform'] = 'claude_code_sdk';
 
       // Per-model beta filtering: skip interleaved-thinking for Haiku,
       // skip effort for non-4.6 models.

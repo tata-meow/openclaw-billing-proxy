@@ -149,7 +149,7 @@ function apiTest(name, body, headers) {
       'content-type': 'application/json',
       'authorization': 'Bearer ' + token,
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24',
+      'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01',
       'content-length': Buffer.byteLength(bodyStr),
       'accept-encoding': 'identity'
     }, headers || {});

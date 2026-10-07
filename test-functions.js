@@ -99,27 +99,23 @@ test('haiku excludes interleaved-thinking', () => {
   const b = T.getModelBetas('claude-haiku-4-5');
   assert.ok(!b.includes('interleaved-thinking-2025-05-14'));
 });
-test('sonnet-4-6 includes effort', () => {
-  assert.ok(T.getModelBetas('claude-sonnet-4-6').includes('effort-2025-11-24'));
+test('sonnet includes per-turn-control', () => {
+  assert.ok(T.getModelBetas('claude-sonnet-4-6').includes('per-turn-control-2026-07-01'));
 });
-test('sonnet-4-5 includes effort', () => {
-  assert.ok(T.getModelBetas('claude-sonnet-4-5').includes('effort-2025-11-24'));
+test('opus includes per-turn-control', () => {
+  assert.ok(T.getModelBetas('claude-opus-4-6').includes('per-turn-control-2026-07-01'));
 });
-test('opus-4-6 includes effort', () => {
-  assert.ok(T.getModelBetas('claude-opus-4-6').includes('effort-2025-11-24'));
-});
-test('all include oauth and claude-code betas', () => {
-  for (const m of ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6']) {
+test('non-haiku models include claude-code and oauth betas', () => {
+  for (const m of ['claude-sonnet-4-6', 'claude-opus-4-6']) {
     const b = T.getModelBetas(m);
     assert.ok(b.includes('oauth-2025-04-20'), `${m} missing oauth`);
     assert.ok(b.includes('claude-code-20250219'), `${m} missing claude-code`);
   }
 });
-test('no fake betas', () => {
-  for (const m of ['claude-haiku-4-5', 'claude-sonnet-4-6']) {
-    const b = T.getModelBetas(m);
-    assert.ok(!b.includes('fast-mode-2026-02-01'));
-  }
+test('haiku excludes claude-code beta', () => {
+  const b = T.getModelBetas('claude-haiku-4-5');
+  assert.ok(!b.includes('claude-code-20250219'), 'haiku should not have claude-code');
+  assert.ok(b.includes('oauth-2025-04-20'), 'haiku should still have oauth');
 });
 
 // E. stripEffortFromObject
