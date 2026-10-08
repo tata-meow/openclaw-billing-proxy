@@ -1,5 +1,76 @@
 # Changelog
 
+## v2.10.0 -- 2026-10-07
+
+### Update Claude Code emulation to CC 2.1.292
+
+Derived from binary analysis of the CC 2.1.292 native binary (Bun runtime).
+The proxy was emulating CC 2.1.211, 81 releases behind.
+
+**Changed:**
+- **CC_VERSION**: 2.1.211 → 2.1.292
+- **SDK version** (`x-stainless-package-version`): 0.112.1 → 0.128.0
+  (anthropic-sdk-typescript)
+- **User-Agent**: `claude-cli/{v} (external, sdk-cli)` → `Anthropic/JS 0.128.0`
+  (matches SDK's `getUserAgent()` which is what the messages API sees)
+- **Runtime version** (`x-stainless-runtime-version`): `v26.3.0` → `v1.4.3`
+  (CC runs on Bun 1.4.3, SDK reports via `process.version`)
+- **Billing header**: added `cc_prompt_index` (monotonic counter) and
+  `cc_turn_index` (always 1 for proxy) fields, matching CC 2.1.292's
+  `_ro()` billing header construction
+- **Beta list**: rebuilt from CC binary's `IN`/`NN` rule arrays — only betas
+  that pass the firstParty + OAuth + sdk-cli filter for the messages API.
+  Internal-only betas (`ccr-byoc`, `mcp-servers`, `cache-keepalive`,
+  `context-hint`, `prompt-caching-evict`, `timing`, etc.) excluded — the API
+  rejects them with 400
+
+**Added:**
+- Header `anthropic-client-platform: claude_code_sdk` (sent by CC on all
+  API requests via `gy()` function)
+- Betas: `redact-thinking-2026-02-12`, `mid-conversation-system-2026-04-07`,
+  `per-turn-control-2026-07-01`
+- `context-1m-2025-08-07` beta now conditional on `[1m]` model suffix,
+  matching CC's `Eu()` guard (`/\[1m\]/i.test(model)`)
+
+**Removed:**
+- Betas `advanced-tool-use-2025-11-20` and `effort-2025-11-24` — no longer
+  in CC 2.1.292's `IN` rules for the messages API (effort is now handled
+  through `per-turn-control`)
+
+**Unchanged (verified still correct):**
+- Billing fingerprint salt `59cf53e54c78` and indices `[4,7,20]`
+- `anthropic-version: 2023-06-01`
+- `oauth-2025-04-20` and `claude-code-20250219` betas
+
+**Verified:** Haiku, Sonnet, and Opus all return HTTP 200 through the
+updated proxy.
+
+## v2.9.0 -- 2026-07-17
+
+### Defeat new server-side detection
+
+Anthropic enabled aggressive detection on 2026-07-16 that hard-blocks all
+proxy requests with 400 "extra usage" regardless of version. Root cause:
+multiple billing/header fields had drifted from genuine CC behavior.
+
+All fixes captured and verified from genuine CC 2.1.211 via capture proxy.
+
+**Changed:**
+- **metadata.user_id**: add `account_uuid` (primary detection tell).
+  Auto-fetches from `/api/oauth/profile` at startup; also settable via
+  `CC_ACCOUNT_UUID` env or `account_uuid` in config.json
+- **Billing header**: `cc_entrypoint` `cli` → `sdk-cli`; drop `cch` field
+- **cc_prev_req**: chain consecutive request-ids (genuine CC chains them;
+  a static or missing value is a detection tell)
+- **User-Agent**: `claude-code/` → `claude-cli/ (external, sdk-cli)`
+- **x-stainless-runtime-version**: pin `v26.3.0` (not `process.version`)
+- **Beta header**: override wholesale instead of merging (order matters —
+  a reordered set is itself a fingerprint)
+- **Upstream path**: add `?beta=true` query param
+
+**Removed:**
+- Unused `computeCch` function
+
 ## v2.8.0 -- 2026-07-17
 
 ### Update Claude Code emulation to CC 2.1.211
