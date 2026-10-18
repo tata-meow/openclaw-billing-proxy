@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.10.1 -- 2026-10-18
+
+### Bump CC emulation to 2.1.302 + fix [1m] context handling
+
+**Changed:**
+- **CC_VERSION**: 2.1.292 → 2.1.302
+- **Bun runtime**: v1.4.3 → v1.4.4
+- Upstream error responses now logged (body first 300 chars) for faster
+  diagnosis of 429/400 errors
+
+**Added:**
+- **`[1m]` suffix handling**: when OpenClaw sends a model name with `[1m]`
+  suffix (e.g. `claude-opus-4-6[1m]`), the proxy strips the suffix from
+  the request body and adds the `context-1m-2025-08-07` beta header.
+  Previously the suffix was sent verbatim, causing `not_found_error` from
+  the API. This matches CC's `gf()` / `Eu()` guard behavior.
+
+**Context (200k vs 1M):**
+Models like `claude-sonnet-4-6` and `claude-opus-4-6` have a native 200k
+context window. Requesting >200k tokens without the `[1m]` suffix or
+without usage credits triggers:
+`429: "Usage credits are required for long context requests."`
+OpenClaw's `openclaw.json` must set `contextWindow: 200000` for these
+models so the context engine compacts before hitting the 200k limit.
+
 ## v2.10.0 -- 2026-10-07
 
 ### Update Claude Code emulation to CC 2.1.292

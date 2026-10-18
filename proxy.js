@@ -36,10 +36,10 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.10.0';
+const VERSION = '2.10.1';
 
 // Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.292';
+const CC_VERSION = '2.1.302';
 
 // Last upstream request-id for cc_prev_req billing-header chaining.
 // Genuine CC chains consecutive requests; a static header is a detection tell.
@@ -279,7 +279,7 @@ function getStainlessHeaders() {
     'x-stainless-os': osName,
     'x-stainless-package-version': '0.128.0',
     'x-stainless-runtime': 'node',
-    'x-stainless-runtime-version': 'v1.4.3',
+    'x-stainless-runtime-version': 'v1.4.4',
     'x-stainless-retry-count': '0',
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
@@ -1410,12 +1410,26 @@ function startServer(config) {
       }
       headers['anthropic-client-platform'] = 'claude_code_sdk';
 
-      // Per-model beta filtering: skip interleaved-thinking for Haiku,
-      // skip effort for non-4.6 models.
-      // Override wholesale — a merged/reordered set is itself a fingerprint.
+      // [1m] suffix handling: OC may send e.g. "claude-opus-4-6[1m]" to request
+      // the 1M context window. The API doesn't accept the suffix — strip it from
+      // the body and add the context-1m beta instead (matching CC's gf() guard).
       const modelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
-      const modelName = modelMatch ? modelMatch[1] : '';
+      let modelName = modelMatch ? modelMatch[1] : '';
+      const wants1m = /\[1[mM]\]/.test(modelName);
+      if (wants1m && modelMatch) {
+        const bare = modelName.replace(/\[1[mM]\]/g, '');
+        bodyStr = bodyStr.replace(modelMatch[0], `"model":"${bare}"`);
+        body = Buffer.from(bodyStr, 'utf8');
+        headers['content-length'] = body.length;
+        modelName = bare;
+        plog(reqNum, `[1M] Stripped [1m] suffix: ${modelMatch[1]} -> ${bare}`);
+      }
+
+      // Per-model beta filtering + 1m beta injection.
       const betas = getModelBetas(modelName);
+      if (wants1m && !betas.includes('context-1m-2025-08-07')) {
+        betas.push('context-1m-2025-08-07');
+      }
       headers['anthropic-beta'] = betas.join(',');
 
       // Genuine CC posts to /v1/messages?beta=true
@@ -1445,6 +1459,7 @@ function startServer(config) {
           upRes.on('data', c => errChunks.push(c));
           upRes.on('end', () => {
             let errBody = Buffer.concat(errChunks).toString();
+            plog(reqNum, `upstream ${status}: ${errBody.slice(0, 300)}`, 'warn');
             if (errBody.includes('extra usage')) {
               plog(reqNum, `DETECTION! Body: ${body.length}b`, 'error');
             }
